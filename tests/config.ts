@@ -1,0 +1,9 @@
+// Reads from .env loaded by playwright.config.ts
+export const SFSF_BASE     = process.env.SFSF_BASE_URL    ?? '';
+export const SFSF_COMPANY  = process.env.SFSF_COMPANY     ?? '';
+export const SFSF_USERNAME = process.env.SFSF_USERNAME    ?? '';
+export const SFSF_PASSWORD = process.env.SFSF_PASSWORD    ?? '';
+export const PY_BASE       = process.env.PY_BASE_URL      ?? '';
+export const PY_COMPANY    = process.env.PY_COMPANY       ?? '';
+export const PY_USERNAME   = process.env.PY_USERNAME      ?? '';
+export const PY_PASSWORD   = process.env.PY_PASSWORD      ?? '';

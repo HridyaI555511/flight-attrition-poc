@@ -1,0 +1,21 @@
+{
+  "name": "flight-attrition-poc",
+  "version": "1.0.0",
+  "description": "Flight attrition risk prediction POC using SAP SuccessFactors OData APIs",
+  "scripts": {
+    "fetch:sfsf":    "npx playwright test tests/sfsf-attrition-data.spec.ts --timeout=300000",
+    "fetch:payroll": "npx playwright test tests/payroll-attrition-data.spec.ts --timeout=300000",
+    "fetch:empjob":  "npx playwright test tests/empjob-paginated.spec.ts --timeout=300000",
+    "fetch:leave":   "npx playwright test tests/leave-data.spec.ts --timeout=300000",
+    "fetch:signals": "npx playwright test tests/additional-signals.spec.ts --timeout=300000",
+    "fetch:all":     "npx playwright test --timeout=300000",
+    "model":         "python3 model/attrition_enriched.py",
+    "dashboard":     "python3 model/build_dashboard.py",
+    "run":           "npm run model && npm run dashboard"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.0",
+    "@types/node": "^25.9.3",
+    "dotenv": "^17.4.2"
+  }
+}

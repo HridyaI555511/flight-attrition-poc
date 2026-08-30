@@ -1,0 +1,26 @@
+# Credentials — never commit
+.env
+
+# Playwright
+node_modules/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+playwright/.auth/
+
+# Extracted fixture data (re-fetchable via tests)
+fixtures/sfsf/
+fixtures/payroll/
+
+# Model outputs (re-generatable via model scripts)
+fixtures/output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# OS
+.DS_Store

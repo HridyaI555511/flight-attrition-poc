@@ -279,6 +279,56 @@ print(f"Active employees with ≥1 manager change: {int((active['mgr_change_coun
 print(f"Active employees with ≥1 org change:     {int((active['org_change_count'] > 0).sum())}")
 print(f"Active employees with ≥1 title change:   {int((active['title_change_count'] > 0).sum())}")
 
+# ── PTO balance (unused leave accrual) ─────────────────────────────────────
+# High unused balance is a known pre-departure signal: employees accumulate
+# leave before resigning to maximise payout or clear obligations.
+ta_raw = load(SFSF, 'time-account')
+tad_raw = []
+for src in [(SFSF, 'time-account-detail')]:
+    p = src[0] / f'{src[1]}.json'
+    if p.exists():
+        tad_raw.extend(load(*src))
+
+uid_to_extcode = {r['userId']: r['externalCode'] for r in ta_raw if r.get('userId')}
+extcode_to_uid = {v: k for k, v in uid_to_extcode.items()}
+
+pto_balances: dict = defaultdict(float)
+for r in tad_raw:
+    key = r.get('TimeAccount_externalCode')
+    amt = float(r.get('bookingAmount') or 0)
+    btype = r.get('bookingType', '')
+    if btype in ('ACCRUAL', 'ADJUSTMENT'):
+        pto_balances[key] += amt
+    elif btype in ('DEDUCTION', 'ABSENCE_DEDUCTION'):
+        pto_balances[key] -= amt
+
+user_pto: dict = defaultdict(float)
+for extcode, bal in pto_balances.items():
+    uid = extcode_to_uid.get(extcode)
+    if uid:
+        user_pto[uid] += max(bal, 0)
+
+pto_df = pd.DataFrame(list(user_pto.items()), columns=['userId', 'pto_balance_days'])
+active = active.merge(pto_df, on='userId', how='left')
+active['pto_balance_days'] = active['pto_balance_days'].fillna(0)
+print(f"Employees with PTO balance data: {(active['pto_balance_days'] > 0).sum()} "
+      f"| Median: {active['pto_balance_days'].median():.1f} days "
+      f"| >20 days: {(active['pto_balance_days'] > 20).sum()}")
+
+# ── Internal job applications ───────────────────────────────────────────────
+# Employees applying for internal roles may signal desire to move; if their
+# applications are declined, external flight risk increases.
+ja_raw = load(SFSF, 'job-applications')
+ja_records = [{'userId': r['usersSysId']} for r in ja_raw if r.get('usersSysId')]
+if ja_records:
+    ja_df = pd.DataFrame(ja_records)
+    ja_count = ja_df.groupby('userId').size().reset_index(name='internal_app_count')
+    active = active.merge(ja_count, on='userId', how='left')
+else:
+    active['internal_app_count'] = 0
+active['internal_app_count'] = active['internal_app_count'].fillna(0)
+print(f"Employees with internal job applications: {(active['internal_app_count'] > 0).sum()}")
+
 # Best salary estimate: direct field first, then annualised pay component
 active['base_salary'] = active['salary_direct'].combine_first(active['annual_salary_pay'])
 
@@ -331,16 +381,26 @@ active['f_high_absence']     = np.clip(safe(active['absence_count'], 0) / 10 * 1
 # 3+ changes = 100, 1-2 = 40-67, 0 = 0
 active['f_mgr_instability']  = np.clip(safe(active['mgr_change_count'], 0) / 3 * 100, 0, 100)
 
+# High unused PTO balance — employees accumulate leave before resigning
+# p90 is ~20 days; normalise against that threshold
+active['f_high_pto_balance'] = np.clip(safe(active['pto_balance_days'], 0) / 20 * 100, 0, 100)
+
+# Internal job applications — applying for roles internally signals desire to move;
+# if not placed, external offer risk rises. Binary in this dataset.
+active['f_internal_application'] = np.where(safe(active['internal_app_count'], 0) > 0, 60, 0)
+
 WEIGHTS = {
-    'f_role_stagnation':  0.20,
-    'f_low_perf':         0.20,
-    'f_compa_ratio':      0.15,
-    'f_stale_comp':       0.13,
-    'f_only_hire':        0.04,
-    'f_short_tenure':     0.07,
-    'f_no_bonus':         0.08,
-    'f_high_absence':     0.08,
-    'f_mgr_instability':  0.05,  # NEW — manager/org change history
+    'f_role_stagnation':      0.20,
+    'f_low_perf':             0.20,
+    'f_compa_ratio':          0.15,
+    'f_stale_comp':           0.10,
+    'f_only_hire':            0.02,
+    'f_short_tenure':         0.06,
+    'f_no_bonus':             0.08,
+    'f_high_absence':         0.08,
+    'f_mgr_instability':      0.03,
+    'f_high_pto_balance':     0.05,  # NEW — unused PTO accrual
+    'f_internal_application': 0.03,  # NEW — internal job applications
 }
 
 active['risk_score'] = sum(active[col] * w for col, w in WEIGHTS.items())
@@ -396,15 +456,17 @@ ax2.legend()
 # 3. Factor contribution: All vs High-risk
 ax3 = fig.add_subplot(gs[1, :])
 factor_labels = {
-    'f_role_stagnation':  'Role\nStagnation',
-    'f_low_perf':         'Low\nPerformance',
-    'f_compa_ratio':      'Below\nMarket Pay ★',
-    'f_stale_comp':       'Stale\nCompensation',
-    'f_only_hire':        'No Raise\nSince Hire',
-    'f_short_tenure':     'Short\nTenure',
-    'f_no_bonus':         'No Bonus\nHistory ★',
-    'f_high_absence':     'High\nAbsence ★',
-    'f_mgr_instability':  'Manager\nInstability ★',
+    'f_role_stagnation':      'Role\nStagnation',
+    'f_low_perf':             'Low\nPerformance',
+    'f_compa_ratio':          'Below\nMarket Pay ★',
+    'f_stale_comp':           'Stale\nCompensation',
+    'f_only_hire':            'No Raise\nSince Hire',
+    'f_short_tenure':         'Short\nTenure',
+    'f_no_bonus':             'No Bonus\nHistory ★',
+    'f_high_absence':         'High\nAbsence ★',
+    'f_mgr_instability':      'Manager\nInstability ★',
+    'f_high_pto_balance':     'High PTO\nBalance ★',
+    'f_internal_application': 'Internal\nApplications ★',
 }
 factors = list(WEIGHTS.keys())
 x = np.arange(len(factors))
@@ -492,6 +554,7 @@ export_cols = ['userId','firstName','lastName','department','division','location
                'base_salary','currency','compa_ratio','has_bonus','bonus_events',
                'absence_count','total_leave_days','loa_flag','sick_count',
                'mgr_change_count','org_change_count','title_change_count',
+               'pto_balance_days','internal_app_count',
                'risk_score','risk_band']
 active[export_cols].sort_values('risk_score', ascending=False).to_csv(
     OUTPUT / 'all_employees_enriched_risk.csv', index=False)
@@ -619,6 +682,8 @@ summary = {
     'avg_compa_ratio': round(float(active['compa_ratio'].mean()), 3),
     'employees_with_absences': int((active['absence_count'] > 0).sum()),
     'employees_with_mgr_changes': int((active['mgr_change_count'] > 0).sum()),
+    'employees_with_high_pto_balance': int((active['pto_balance_days'] > 20).sum()),
+    'employees_with_internal_applications': int((active['internal_app_count'] > 0).sum()),
     'risk_bands': {
         'high':   int((active['risk_band']=='High').sum()),
         'medium': int((active['risk_band']=='Medium').sum()),

@@ -5,7 +5,7 @@ Reads the CSV / JSON outputs of attrition_enriched.py and embeds them.
 import json, math, pandas as pd, numpy as np
 from pathlib import Path
 
-FIXTURES = Path(__file__).parent.parent / 'fixtures'
+FIXTURES = Path(__file__).parent.parent / 'fixtures' / 'output'
 
 df     = pd.read_csv(FIXTURES / 'all_employees_enriched_risk.csv')
 expl   = pd.read_csv(FIXTURES / 'high_risk_enriched_explanations.csv')

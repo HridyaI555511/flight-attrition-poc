@@ -8,6 +8,7 @@
     "fetch:empjob":  "npx playwright test tests/empjob-paginated.spec.ts --timeout=300000",
     "fetch:leave":   "npx playwright test tests/leave-data.spec.ts --timeout=300000",
     "fetch:signals": "npx playwright test tests/additional-signals.spec.ts --timeout=300000",
+    "fetch:reports": "npx playwright test tests/sf-reports.spec.ts --timeout=300000",
     "fetch:all":     "npx playwright test --timeout=300000",
     "model":         "python3 model/attrition_enriched.py",
     "dashboard":     "python3 model/build_dashboard.py",

@@ -31,9 +31,18 @@ BASE_COMP_KEYWORDS = ['BASESAL','BASIC','BASE_','EEB_','BASAL','SALARIO']
 def parse_date(val):
     if not val: return None
     if isinstance(val, str) and val.startswith('/Date('):
-        ms = int(val.replace('/Date(', '').split('+')[0].split('-')[0].split(')')[0])
+        inner = val.replace('/Date(', '').split(')')[0]
+        if '+' in inner:
+            inner = inner.split('+')[0]
+        try:
+            ms = int(inner)
+        except ValueError:
+            return None
         if ms >= FAR_FUTURE_MS: return None
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        try:
+            return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
     return None
 
 def years_since(dt):
@@ -329,8 +338,121 @@ else:
 active['internal_app_count'] = active['internal_app_count'].fillna(0)
 print(f"Employees with internal job applications: {(active['internal_app_count'] > 0).sum()}")
 
-# Best salary estimate: direct field first, then annualised pay component
-active['base_salary'] = active['salary_direct'].combine_first(active['annual_salary_pay'])
+# ── SF-side recurring pay (additional salary source) ───────────────────────
+# Augments payroll salary coverage with SF-side pay components
+sf_pay_raw = load(SFSF, 'emp-pay-recurring') if (SFSF / 'emp-pay-recurring.json').exists() else []
+sf_base_records = []
+for p in sf_pay_raw:
+    comp = str(p.get('payComponent', '')).upper()
+    if not any(kw in comp for kw in BASE_COMP_KEYWORDS):
+        continue
+    val = float(p['paycompvalue']) if p.get('paycompvalue') else 0
+    freq = p.get('frequency', 'MON')
+    annual = val * FREQ_TO_ANNUAL.get(freq, 12)
+    if annual > 0:
+        sf_base_records.append({'userId': p['userId'], 'sf_annual_salary': annual, 'sf_currency': p.get('currencyCode')})
+sf_pay_df = pd.DataFrame(sf_base_records)
+if not sf_pay_df.empty:
+    sf_pay_max = sf_pay_df.groupby('userId').agg(sf_annual_salary=('sf_annual_salary','max'), sf_currency=('sf_currency','first')).reset_index()
+else:
+    sf_pay_max = pd.DataFrame(columns=['userId','sf_annual_salary','sf_currency'])
+active = active.merge(sf_pay_max, on='userId', how='left')
+
+# ── Pay grade via position linkage ─────────────────────────────────────────
+# Links each employee's position (from EmpJob) to a pay grade (from Position).
+pos_raw = load(SFSF, 'position') if (SFSF / 'position.json').exists() else []
+pos_grade_map = {r['code']: r.get('payGrade') for r in pos_raw if r.get('payGrade')}
+ej_pos = {r['userId']: str(r.get('position') or '') for r in job_raw if r.get('position')}
+active['pay_grade'] = active['userId'].map(lambda uid: pos_grade_map.get(ej_pos.get(uid, ''), None))
+grade_coverage = active['pay_grade'].notna().sum()
+print(f"Pay grade coverage: {grade_coverage}/{len(active)} employees | Unique grades: {active['pay_grade'].nunique()}")
+
+# ── Gender from PerPersonal (reporting only, not used in scoring) ───────────
+pp_raw = load(SFSF, 'per-personal') if (SFSF / 'per-personal.json').exists() else []
+gender_df = pd.DataFrame([{'userId': str(r['personIdExternal']), 'gender': r.get('gender')} for r in pp_raw if r.get('gender')])
+if not gender_df.empty:
+    active = active.merge(gender_df, on='userId', how='left')
+else:
+    active['gender'] = None
+print(f"Gender data coverage: {active['gender'].notna().sum()}")
+
+# ── Calibration coverage ────────────────────────────────────────────────────
+# Employees included in a calibration session are actively tracked by management.
+# Those NOT in calibration have lower visibility — a mild risk signal.
+calib_raw = load(SFSF, 'calibration-subjects') if (SFSF / 'calibration-subjects.json').exists() else []
+calib_uids = set(str(r.get('userId', '')) for r in calib_raw if r.get('userId'))
+active['in_calibration'] = active['userId'].isin(calib_uids).astype(int)
+print(f"Employees in calibration sessions: {active['in_calibration'].sum()}")
+
+# ── Open job requisitions in department ─────────────────────────────────────
+# Active job requisitions in a department signal team gaps / attrition pressure.
+# Employees in understaffed departments are more likely to be overloaded and leave.
+jr_raw = load(SFSF, 'job-requisitions') if (SFSF / 'job-requisitions.json').exists() else []
+open_jr = [r for r in jr_raw if r.get('deleted') == 'Not Deleted']
+dept_open_reqs: dict = defaultdict(int)
+for r in open_jr:
+    dept_raw = r.get('departmentCode', '') or ''
+    dept = dept_raw.split('(')[0].strip()
+    if dept:
+        dept_open_reqs[dept] += 1
+active['open_reqs_in_dept'] = active['department'].map(dept_open_reqs).fillna(0)
+print(f"Employees in depts with open requisitions: {(active['open_reqs_in_dept'] > 0).sum()}")
+
+# ── Age / Career stage (from PerPerson) ────────────────────────────────────
+# Early-career employees (<32) have higher market mobility and are more likely
+# to leave for new opportunities. Note: use with caution — age discrimination
+# laws apply; this signal informs statistical prediction only.
+pp_raw = load(SFSF, 'per-person') if (SFSF / 'per-person.json').exists() else []
+age_rows = []
+for r in pp_raw:
+    dob_val = r.get('dateOfBirth')
+    if dob_val:
+        dob = parse_date(dob_val)
+        if dob:
+            age = max((NOW - dob).days / 365.25, 0)
+            if 15 < age < 80:
+                age_rows.append({'userId': str(r['personIdExternal']), 'age_years': age})
+age_df = pd.DataFrame(age_rows) if age_rows else pd.DataFrame(columns=['userId','age_years'])
+active = active.merge(age_df, on='userId', how='left')
+active['age_years'] = active['age_years'].fillna(active['age_years'].median() if not age_df.empty else 40)
+print(f"Employees with age data: {age_df['userId'].nunique()} | Median age: {active['age_years'].median():.0f}")
+
+# ── Unmet bonus expectation (from EmpCompensation) ─────────────────────────
+# Employees with a bonus target in SF but no bonus paid in payroll have an
+# unmet expectation — a well-documented voluntary exit trigger.
+ec_raw = load(SFSF, 'emp-compensation') if (SFSF / 'emp-compensation.json').exists() else []
+ec_df = pd.DataFrame([{
+    'userId': r['userId'],
+    'bonus_target': float(r['bonusTarget']) if r.get('bonusTarget') else 0,
+} for r in ec_raw])
+if not ec_df.empty:
+    # Keep latest record per employee
+    ec_latest = ec_df[ec_df['bonus_target'] > 0].groupby('userId')['bonus_target'].max().reset_index()
+    active = active.merge(ec_latest, on='userId', how='left')
+else:
+    active['bonus_target'] = 0
+active['bonus_target'] = active['bonus_target'].fillna(0)
+bt_with_no_payout = ((active['bonus_target'] > 0) & (active['has_bonus'] == 0)).sum()
+print(f"Employees with bonus target but no payout: {bt_with_no_payout}")
+
+# ── Pay group (from EmpCompensation.payGroup) ───────────────────────────────
+# Pay group classifies employees into compensation pools (e.g. 'US', 'D2', 'CN').
+# Employees below their pay group median are outliers within the same comp class —
+# more precise than department median because pay groups cut across role families.
+pg_df = pd.DataFrame([{
+    'userId': r['userId'],
+    'pay_group': r.get('payGroup'),
+} for r in ec_raw if r.get('payGroup')])
+if not pg_df.empty:
+    pg_latest = pg_df.drop_duplicates('userId', keep='first')
+    active = active.merge(pg_latest, on='userId', how='left')
+else:
+    active['pay_group'] = None
+pg_coverage = active['pay_group'].notna().sum()
+print(f"Pay group coverage: {pg_coverage}/{len(active)} | Unique groups: {active['pay_group'].nunique()}")
+
+# Best salary estimate: payroll direct → payroll recurring → SF-side recurring
+active['base_salary'] = active['salary_direct'].combine_first(active['annual_salary_pay']).combine_first(active['sf_annual_salary'])
 
 # Compa-ratio proxy: salary vs dept median (within same currency group)
 dept_median = active.groupby('department')['base_salary'].median().reset_index(name='dept_median_salary')
@@ -341,6 +463,15 @@ active['compa_ratio'] = np.where(
     np.nan
 )
 active['below_market'] = (active['compa_ratio'] < 0.9).astype(float)
+
+# Pay-group compa-ratio: salary vs pay group median (more precise than dept median)
+pg_median = active.groupby('pay_group')['base_salary'].median().reset_index(name='pg_median_salary')
+active = active.merge(pg_median, on='pay_group', how='left')
+active['pay_group_compa_ratio'] = np.where(
+    active['pg_median_salary'] > 0,
+    active['base_salary'] / active['pg_median_salary'],
+    np.nan
+)
 
 salary_coverage = active['base_salary'].notna().sum()
 print(f"Salary coverage: {salary_coverage}/{len(active)} employees ({salary_coverage/len(active)*100:.0f}%)")
@@ -389,18 +520,47 @@ active['f_high_pto_balance'] = np.clip(safe(active['pto_balance_days'], 0) / 20 
 # if not placed, external offer risk rises. Binary in this dataset.
 active['f_internal_application'] = np.where(safe(active['internal_app_count'], 0) > 0, 60, 0)
 
+# Early career stage — employees under 32 have higher market mobility
+# Score peaks at age 22 (100), reaches 0 at age 35
+active['f_early_career'] = np.clip((35 - safe(active['age_years'], 40)) / 13 * 100, 0, 100)
+
+# Unmet bonus expectation — has a bonus target in SF but no payout recorded
+# One of the most direct measures of unmet compensation expectations
+active['f_unmet_bonus'] = np.where(
+    (safe(active['bonus_target'], 0) > 0) & (safe(active['has_bonus'], 0) == 0), 80, 0
+)
+
+# Not in calibration — employees absent from calibration have lower management visibility
+active['f_not_calibrated'] = (1 - safe(active['in_calibration'], 0)) * 30
+
+# Open requisitions in department — team gap signals burnout / instability pressure
+active['f_open_req_in_dept'] = np.where(safe(active['open_reqs_in_dept'], 0) > 0, 50, 0)
+
+# Pay group compa-ratio — employees below their pay group median (same comp class)
+# Uses pay group median when available; falls back to dept compa-ratio
+active['f_pay_group_compa'] = np.where(
+    active['pay_group_compa_ratio'].notna(),
+    np.clip((1.1 - active['pay_group_compa_ratio']) / 0.6 * 100, 0, 100),
+    active['f_compa_ratio']  # fall back to dept compa if no pay group data
+)
+
 WEIGHTS = {
     'f_role_stagnation':      0.20,
     'f_low_perf':             0.20,
-    'f_compa_ratio':          0.15,
-    'f_stale_comp':           0.10,
-    'f_only_hire':            0.02,
-    'f_short_tenure':         0.06,
-    'f_no_bonus':             0.08,
+    'f_compa_ratio':          0.12,
+    'f_stale_comp':           0.08,
+    'f_only_hire':            0.00,
+    'f_short_tenure':         0.02,
+    'f_no_bonus':             0.06,
     'f_high_absence':         0.08,
-    'f_mgr_instability':      0.03,
-    'f_high_pto_balance':     0.05,  # NEW — unused PTO accrual
-    'f_internal_application': 0.03,  # NEW — internal job applications
+    'f_mgr_instability':      0.02,
+    'f_high_pto_balance':     0.05,
+    'f_internal_application': 0.00,
+    'f_early_career':         0.03,
+    'f_unmet_bonus':          0.07,
+    'f_not_calibrated':       0.02,
+    'f_open_req_in_dept':     0.02,
+    'f_pay_group_compa':      0.03,
 }
 
 active['risk_score'] = sum(active[col] * w for col, w in WEIGHTS.items())
@@ -467,6 +627,11 @@ factor_labels = {
     'f_mgr_instability':      'Manager\nInstability ★',
     'f_high_pto_balance':     'High PTO\nBalance ★',
     'f_internal_application': 'Internal\nApplications ★',
+    'f_early_career':         'Early\nCareer Stage ★',
+    'f_unmet_bonus':          'Unmet Bonus\nExpectation ★',
+    'f_not_calibrated':       'Not in\nCalibration ★',
+    'f_open_req_in_dept':     'Open Reqs\nin Dept ★',
+    'f_pay_group_compa':      'Pay Group\nCompa ★',
 }
 factors = list(WEIGHTS.keys())
 x = np.arange(len(factors))
@@ -549,12 +714,15 @@ print("  Saved: attrition_enriched.png")
 # 5. EXPORTS
 # ══════════════════════════════════════════════════════════════════
 export_cols = ['userId','firstName','lastName','department','division','location',
+               'gender','pay_grade','pay_group',
                'tenure_years','tenure_in_role_years','perf_rating',
                'months_since_comp_change','only_hire_comp','review_count',
-               'base_salary','currency','compa_ratio','has_bonus','bonus_events',
+               'base_salary','currency','compa_ratio','pay_group_compa_ratio','has_bonus','bonus_events',
+               'bonus_target','age_years',
                'absence_count','total_leave_days','loa_flag','sick_count',
                'mgr_change_count','org_change_count','title_change_count',
                'pto_balance_days','internal_app_count',
+               'in_calibration','open_reqs_in_dept',
                'risk_score','risk_band']
 active[export_cols].sort_values('risk_score', ascending=False).to_csv(
     OUTPUT / 'all_employees_enriched_risk.csv', index=False)
@@ -684,6 +852,7 @@ summary = {
     'employees_with_mgr_changes': int((active['mgr_change_count'] > 0).sum()),
     'employees_with_high_pto_balance': int((active['pto_balance_days'] > 20).sum()),
     'employees_with_internal_applications': int((active['internal_app_count'] > 0).sum()),
+    'employees_with_unmet_bonus_target': int(bt_with_no_payout),
     'risk_bands': {
         'high':   int((active['risk_band']=='High').sum()),
         'medium': int((active['risk_band']=='Medium').sum()),

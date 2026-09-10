@@ -11,6 +11,9 @@ df     = pd.read_csv(FIXTURES / 'all_employees_enriched_risk.csv')
 expl   = pd.read_csv(FIXTURES / 'high_risk_enriched_explanations.csv')
 summary = json.loads((FIXTURES / 'attrition_enriched_summary.json').read_text())
 
+_bt_path = FIXTURES / 'backtest_results.json'
+backtest = json.loads(_bt_path.read_text()) if _bt_path.exists() else None
+
 # ── helpers ────────────────────────────────────────────────────────────────────
 def fmt(v, decimals=1):
     if v is None or (isinstance(v, float) and math.isnan(v)): return '—'
@@ -221,6 +224,31 @@ html = f"""<!DOCTYPE html>
   .reasons li::before{{content:attr(data-n)". ";font-weight:700;color:#0070f3}}
   .reasons li b{{color:#2c3e50}}
   .count-label{{font-size:13px;color:#666;margin-bottom:10px}}
+  /* ── Ask AI ── */
+  .chat-wrap{{max-width:860px;margin:0 auto;display:flex;flex-direction:column;height:calc(100vh - 180px);min-height:500px}}
+  .chat-status{{display:flex;align-items:center;gap:8px;padding:6px 0 12px;font-size:13px;color:#666}}
+  .sdot{{width:10px;height:10px;border-radius:50%;background:#f39c12;flex-shrink:0;transition:.3s}}
+  .sdot.on{{background:#27ae60}} .sdot.off{{background:#e74c3c}}
+  .chat-sugg{{margin-bottom:14px}}
+  .sugg-lbl{{font-size:12px;color:#888;margin-bottom:7px}}
+  .sugg-chips{{display:flex;gap:7px;flex-wrap:wrap}}
+  .chip{{background:#e8f4fd;color:#0070f3;border:1px solid #b3d9f7;border-radius:20px;padding:5px 13px;font-size:12px;cursor:pointer}}
+  .chip:hover{{background:#d0ebff}}
+  .chat-msgs{{flex:1;overflow-y:auto;padding:16px;background:#fff;border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:12px}}
+  .cmsg{{margin-bottom:14px;display:flex;flex-direction:column}}
+  .cmsg.user{{align-items:flex-end}} .cmsg.assistant{{align-items:flex-start}}
+  .cbubble{{max-width:82%;padding:11px 15px;border-radius:14px;font-size:13px;line-height:1.65}}
+  .cmsg.user .cbubble{{background:#0070f3;color:#fff;border-bottom-right-radius:4px}}
+  .cmsg.assistant .cbubble{{background:#f0f2f5;color:#333;border-bottom-left-radius:4px;white-space:pre-wrap}}
+  .cmeta{{font-size:11px;color:#bbb;margin-top:3px;padding:0 3px}}
+  .typing-dot{{display:inline-block;width:7px;height:7px;border-radius:50%;background:#999;margin:0 2px;animation:blink 1.2s infinite}}
+  .typing-dot:nth-child(2){{animation-delay:.2s}} .typing-dot:nth-child(3){{animation-delay:.4s}}
+  @keyframes blink{{0%,80%,100%{{opacity:.2}} 40%{{opacity:1}}}}
+  .chat-in-row{{display:flex;gap:10px}}
+  .chat-in-row input{{flex:1;padding:11px 15px;border:1.5px solid #ddd;border-radius:10px;font-size:14px;outline:none}}
+  .chat-in-row input:focus{{border-color:#0070f3}}
+  .chat-in-row button{{padding:11px 22px;background:#0070f3;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer}}
+  .chat-in-row button:hover{{background:#005ac7}} .chat-in-row button:disabled{{background:#bbb;cursor:default}}
 </style>
 </head>
 <body>
@@ -234,6 +262,8 @@ html = f"""<!DOCTYPE html>
   <div class="tab active" onclick="showTab('overview',this)">Overview &amp; Charts</div>
   <div class="tab" onclick="showTab('register',this)">Employee Risk Register</div>
   <div class="tab" onclick="showTab('explanations',this)">High-Risk Explanations</div>
+  <div class="tab" onclick="showTab('validation',this)">Model Validation</div>
+  <div class="tab" onclick="showTab('askai',this)">Ask AI</div>
 </div>
 
 <div id="overview" class="panel active">
@@ -321,8 +351,7 @@ html = f"""<!DOCTYPE html>
 </div>
 
 <div id="explanations" class="panel">
-  <div class="filters-row">
-    <input type="text" id="cardSearch" placeholder="Search employee name or department..." oninput="filterCards()">
+  <div class="filters-row">    <input type="text" id="cardSearch" placeholder="Search employee name or department..." oninput="filterCards()">
     <select id="cardSort" onchange="sortCards()">
       <option value="riskScore_desc">Sort: Highest Risk First</option>
       <option value="compaRatio_asc">Sort: Lowest Compa-Ratio First</option>
@@ -342,9 +371,41 @@ html = f"""<!DOCTYPE html>
   <div class="cards-grid" id="cardsGrid"></div>
 </div>
 
+<div id="validation" class="panel">
+</div>
+
+<div id="askai" class="panel">
+  <div class="chat-wrap">
+    <div class="chat-status">
+      <span class="sdot" id="sdot"></span>
+      <span id="stext">Connecting to AI server...</span>
+      <span style="margin-left:auto;display:flex;align-items:center;gap:8px">
+        <span id="dataAge" style="font-size:12px;color:#aaa"></span>
+        <button id="syncBtn" onclick="syncFromSAP()" style="padding:5px 12px;background:#0070f3;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer">Sync from SAP</button>
+      </span>
+    </div>
+    <div class="chat-sugg" id="chatSugg">
+      <div class="sugg-lbl">Suggested questions</div>
+      <div class="sugg-chips">
+        <button class="chip" onclick="useChip(this)">Who are the top 5 highest risk employees?</button>
+        <button class="chip" onclick="useChip(this)">What&apos;s driving risk in the Engineering department?</button>
+        <button class="chip" onclick="useChip(this)">Which employees have low pay and no performance review?</button>
+        <button class="chip" onclick="useChip(this)">Suggest retention actions for our high-risk cohort</button>
+        <button class="chip" onclick="useChip(this)">Which departments have the most role stagnation?</button>
+      </div>
+    </div>
+    <div class="chat-msgs" id="chatMsgs"></div>
+    <div class="chat-in-row">
+      <input id="chatIn" type="text" placeholder="Ask about your workforce risk data..." onkeydown="if(event.key==='Enter')sendChat()">
+      <button id="chatBtn" onclick="sendChat()">Send</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const EMPLOYEES = {json.dumps(emp_records)};
 const HIGH_CARDS = {json.dumps(high_cards)};
+const BACKTEST   = {json.dumps(backtest)};
 
 // ── tabs ───────────────────────────────────────────────────────────────────
 function showTab(id, el) {{
@@ -602,6 +663,206 @@ function sortCardsData(d) {{
 function sortCards() {{ filterCards(); }}
 
 renderCards(cardsData);
+
+// ── validation tab ─────────────────────────────────────────────────────────
+(function buildValidation() {{
+  const panel = document.getElementById('validation');
+  if (!BACKTEST) {{
+    panel.innerHTML = '<p style="padding:24px;color:#888">No backtest data found. Run the model first.</p>';
+    return;
+  }}
+  const {{n_leavers,n_high,n_medium,n_low,capture_rate_pct,avg_leaver_score,avg_active_score,score_separation,score_labels,leaver_hist_pct,active_hist_pct,note}} = BACKTEST;
+  const sepColor = score_separation > 5 ? '#27ae60' : score_separation > 0 ? '#f39c12' : '#e74c3c';
+  const captureColor = capture_rate_pct >= 70 ? '#27ae60' : capture_rate_pct >= 40 ? '#f39c12' : '#e74c3c';
+
+  panel.innerHTML = `
+    <div class="kpi-row">
+      <div class="kpi neu"><div class="kpi-val">${{n_leavers}}</div><div class="kpi-label">Historical Leavers (n)</div></div>
+      <div class="kpi high"><div class="kpi-val">${{n_high}}</div><div class="kpi-label">Would Have Been High Risk</div></div>
+      <div class="kpi med"><div class="kpi-val">${{n_medium}}</div><div class="kpi-label">Would Have Been Medium Risk</div></div>
+      <div class="kpi low"><div class="kpi-val">${{n_low}}</div><div class="kpi-label">Would Have Been Low Risk</div></div>
+      <div class="kpi neu" style="border-top:4px solid ${{captureColor}}"><div class="kpi-val" style="color:${{captureColor}}">${{capture_rate_pct}}%</div><div class="kpi-label">Capture Rate (High+Medium)</div></div>
+      <div class="kpi neu" style="border-top:4px solid ${{sepColor}}"><div class="kpi-val" style="color:${{sepColor}}">+${{score_separation}}</div><div class="kpi-label">Score Separation (leavers vs active)</div></div>
+    </div>
+    <div class="charts-grid">
+      <div class="chart-card wide">
+        <h3>Risk Score Distribution — Historical Leavers vs Active Employees (% of each group)</h3>
+        <canvas id="btHistChart" style="max-height:320px"></canvas>
+      </div>
+      <div class="chart-card">
+        <h3>Leaver Risk Band Breakdown</h3>
+        <canvas id="btDonut"></canvas>
+      </div>
+      <div class="chart-card">
+        <h3>Score Averages Comparison</h3>
+        <canvas id="btBar"></canvas>
+      </div>
+    </div>
+    <div style="background:#fff;border-radius:10px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-top:4px">
+      <h3 style="font-size:14px;font-weight:700;color:#2c3e50;margin-bottom:10px">Methodology &amp; Limitations</h3>
+      <p style="font-size:13px;color:#555;line-height:1.7">${{note}}</p>
+      <ul style="font-size:13px;color:#555;margin-top:12px;padding-left:18px;line-height:2">
+        <li><b>Capture rate ≥ 70%</b> → strong signal. 40–70% → moderate. &lt;40% → weights need recalibration.</li>
+        <li><b>Score separation > 5 pts</b> → model discriminates meaningfully between leavers and stayers.</li>
+        <li>To improve: fetch full termination history from SF Reports → run as time-series back-test per quarter.</li>
+      </ul>
+    </div>
+  `;
+
+  // Histogram
+  new Chart(document.getElementById('btHistChart'), {{
+    type: 'bar',
+    data: {{
+      labels: score_labels,
+      datasets: [
+        {{label:'Historical Leavers', data:leaver_hist_pct, backgroundColor:'#e74c3c99'}},
+        {{label:'Active Employees',   data:active_hist_pct, backgroundColor:'#3498db99'}},
+      ]
+    }},
+    options: {{
+      scales: {{
+        x: {{title:{{display:true,text:'Risk Score Range'}}}},
+        y: {{title:{{display:true,text:'% of Group'}}, max:60}}
+      }},
+      plugins: {{legend:{{position:'top'}}}}
+    }}
+  }});
+
+  // Donut
+  new Chart(document.getElementById('btDonut'), {{
+    type: 'doughnut',
+    data: {{
+      labels:[`High (${{n_high}})`,`Medium (${{n_medium}})`,`Low (${{n_low}})`],
+      datasets:[{{data:[n_high,n_medium,n_low],backgroundColor:['#e74c3c','#f39c12','#27ae60'],borderWidth:3}}]
+    }},
+    options:{{plugins:{{legend:{{position:'bottom'}}}},cutout:'55%'}}
+  }});
+
+  // Bar comparison
+  new Chart(document.getElementById('btBar'), {{
+    type: 'bar',
+    data: {{
+      labels: ['Historical Leavers','Active Employees'],
+      datasets: [{{
+        label:'Avg Risk Score',
+        data:[avg_leaver_score, avg_active_score],
+        backgroundColor:['#e74c3c','#3498db'],
+        borderRadius:6
+      }}]
+    }},
+    options:{{
+      scales:{{y:{{max:100,title:{{display:true,text:'Avg Risk Score'}}}}}},
+      plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:(c)=>` Avg score: ${{c.raw}}`}}}}}}
+    }}
+  }});
+}})();
+// ── ask ai ─────────────────────────────────────────────────────────────────
+const RAG = 'http://localhost:5001';
+let chatHist = [];
+
+function _esc(s) {{
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}}
+
+function _addMsg(role, html) {{
+  const msgs = document.getElementById('chatMsgs');
+  const d = document.createElement('div');
+  d.className = 'cmsg ' + role;
+  const t = new Date().toLocaleTimeString([],{{hour:'2-digit',minute:'2-digit'}});
+  d.innerHTML = `<div class="cbubble">${{html}}</div><div class="cmeta">${{t}}</div>`;
+  msgs.appendChild(d);
+  msgs.scrollTop = msgs.scrollHeight;
+}}
+
+function _addTyping() {{
+  const msgs = document.getElementById('chatMsgs');
+  const d = document.createElement('div');
+  d.className = 'cmsg assistant'; d.id = 'typing';
+  d.innerHTML = '<div class="cbubble"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>';
+  msgs.appendChild(d);
+  msgs.scrollTop = msgs.scrollHeight;
+}}
+
+function _checkStatus() {{
+  fetch(RAG+'/health',{{signal:AbortSignal.timeout(3000)}})
+    .then(r=>r.json())
+    .then(d=>{{
+      document.getElementById('sdot').className='sdot on';
+      document.getElementById('stext').textContent=`AI server online — ${{d.indexed}} employees indexed`;
+      if(d.data_age) document.getElementById('dataAge').textContent=`Data: ${{d.data_age}}`;
+    }})
+    .catch(()=>{{
+      document.getElementById('sdot').className='sdot off';
+      document.getElementById('stext').textContent='AI server offline — run: python model/rag_server.py';
+    }});
+}}
+
+let _syncInterval = null;
+async function syncFromSAP() {{
+  const btn = document.getElementById('syncBtn');
+  btn.disabled = true; btn.textContent = 'Syncing…';
+  try {{
+    await fetch(RAG+'/refresh', {{method:'POST'}});
+  }} catch(e) {{ btn.disabled=false; btn.textContent='Sync from SAP'; return; }}
+  _syncInterval = setInterval(async () => {{
+    try {{
+      const r = await fetch(RAG+'/refresh/status');
+      const d = await r.json();
+      btn.textContent = d.message || 'Syncing…';
+      if(d.data_age) document.getElementById('dataAge').textContent=`Data: ${{d.data_age}}`;
+      if(d.status === 'done') {{
+        clearInterval(_syncInterval);
+        btn.disabled=false; btn.textContent='Sync from SAP';
+        _addMsg('assistant', '✓ Live data synced from SAP SuccessFactors. Index rebuilt with fresh employee data.');
+        _checkStatus();
+      }} else if(d.status === 'error') {{
+        clearInterval(_syncInterval);
+        btn.disabled=false; btn.textContent='Sync from SAP';
+        _addMsg('assistant', 'Sync failed: '+d.message);
+      }}
+    }} catch(e) {{ clearInterval(_syncInterval); btn.disabled=false; btn.textContent='Sync from SAP'; }}
+  }}, 5000);
+}}
+
+async function sendChat() {{
+  const inp = document.getElementById('chatIn');
+  const btn = document.getElementById('chatBtn');
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = ''; btn.disabled = true;
+  document.getElementById('chatSugg').style.display = 'none';
+  _addMsg('user', _esc(text));
+  _addTyping();
+  try {{
+    const r = await fetch(RAG+'/chat', {{
+      method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{message:text,history:chatHist}}),
+      signal:AbortSignal.timeout(90000)
+    }});
+    const data = await r.json();
+    document.getElementById('typing')?.remove();
+    if (data.error) {{
+      _addMsg('assistant','Error: '+_esc(data.error));
+    }} else {{
+      _addMsg('assistant', _esc(data.response));
+      chatHist.push({{role:'user',content:text}});
+      chatHist.push({{role:'assistant',content:data.response}});
+    }}
+  }} catch(e) {{
+    document.getElementById('typing')?.remove();
+    _addMsg('assistant','Could not reach the AI server.\\n\\nMake sure it is running:\\n  python model/rag_server.py');
+  }}
+  btn.disabled = false;
+}}
+
+function useChip(btn) {{
+  document.getElementById('chatIn').value = btn.textContent;
+  sendChat();
+}}
+
+_checkStatus();
+setInterval(_checkStatus, 30000);
 </script>
 </body>
 </html>"""

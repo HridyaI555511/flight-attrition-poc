@@ -30,15 +30,24 @@ dept_risk = (df.groupby('department')['risk_score'].mean()
 # Factor weights
 WEIGHTS = summary['factor_weights']
 FACTOR_LABELS = {
-    'f_role_stagnation': 'Role Stagnation',
-    'f_low_perf':        'Low Performance',
-    'f_compa_ratio':     'Below Market Pay',
-    'f_stale_comp':      'Stale Compensation',
-    'f_only_hire':       'No Raise Since Hire',
-    'f_short_tenure':    'Short Tenure',
-    'f_no_bonus':        'No Bonus History',
-    'f_high_absence':    'High Absence',
-    'f_mgr_instability': 'Manager Instability',
+    'f_role_stagnation':     'Role Stagnation',
+    'f_low_perf':            'Low Performance',
+    'f_compa_ratio':         'Below Market Pay',
+    'f_stale_comp':          'Stale Compensation',
+    'f_only_hire':           'No Raise Since Hire',
+    'f_short_tenure':        'Short Tenure',
+    'f_no_bonus':            'No Bonus History',
+    'f_high_absence':        'High Absence',
+    'f_mgr_instability':     'Manager Instability',
+    'f_high_pto_balance':    'High PTO Balance',
+    'f_internal_application':'Internal Application',
+    'f_early_career':        'Early Career Stage',
+    'f_unmet_bonus':         'Unmet Bonus',
+    'f_not_calibrated':      'Not Calibrated',
+    'f_open_req_in_dept':    'Open Reqs in Dept',
+    'f_pay_group_compa':     'Pay Group Compa',
+    'f_part_time':           'Part-Time Hours',
+    'f_not_in_mentoring':    'Not in Mentoring',
 }
 
 # Risk score histogram buckets
@@ -79,6 +88,15 @@ for _, row in df.iterrows():
         'riskScore':    round(float(row['risk_score']), 1),
         'riskBand':     str(row['risk_band']),
         'onlyHire':     bool(row.get('only_hire_comp', 0)),
+        'ptoDays':      round(float(row['pto_balance_days']), 1) if pd.notna(row.get('pto_balance_days')) else 0,
+        'inCalibration': bool(row.get('in_calibration', 0)),
+        'openReqs':     int(row.get('open_reqs_in_dept', 0)) if pd.notna(row.get('open_reqs_in_dept')) else 0,
+        'payGroupCompa': round(float(row['pay_group_compa_ratio']), 3) if pd.notna(row.get('pay_group_compa_ratio')) else None,
+        'internalApps': int(row.get('internal_app_count', 0)) if pd.notna(row.get('internal_app_count')) else 0,
+        'ageYears':     round(float(row['age_years']), 1) if pd.notna(row.get('age_years')) else None,
+        'bonusTarget':  round(float(row.get('bonus_target', 0)), 1) if pd.notna(row.get('bonus_target')) else 0,
+        'bonusEvents':  int(row.get('bonus_events', 0)) if pd.notna(row.get('bonus_events')) else 0,
+        'inMentoring':  int(row.get('in_mentoring', 0)) if pd.notna(row.get('in_mentoring')) else 0,
     })
 
 # Build high-risk cards JSON (merge explanations with main df)
@@ -498,16 +516,27 @@ const WEIGHTS = {json.dumps(WEIGHTS)};
 const FACTOR_LABELS = {json.dumps(FACTOR_LABELS)};
 function computeFactorScores(emp) {{
   const cr = emp.compaRatio;
+  const pgcr = emp.payGroupCompa;
+  const age = emp.ageYears || 99;
   return {{
-    f_role_stagnation: Math.min((emp.roleTenure||0)/5*100,100),
-    f_low_perf:        emp.perf==null?60:Math.max(0,Math.min((5-(emp.perf||3))/4*100,100)),
-    f_compa_ratio:     cr==null?50:Math.max(0,Math.min((1.1-cr)/0.6*100,100)),
-    f_stale_comp:      Math.min((emp.mthsSinceRaise||36)/36*100,100),
-    f_only_hire:       emp.onlyHire?100:0,
-    f_short_tenure:    Math.max(0,(2-Math.min(emp.tenure||0,2))/2*100),
-    f_no_bonus:        emp.hasBonus?0:70,
-    f_high_absence:    Math.min((emp.absenceCount||0)/10*100,100),
-    f_mgr_instability: Math.min((emp.mgrChanges||0)/3*100,100),
+    f_role_stagnation:     Math.min((emp.roleTenure||0)/5*100,100),
+    f_low_perf:            emp.perf==null?60:Math.max(0,Math.min((5-(emp.perf||3))/4*100,100)),
+    f_compa_ratio:         cr==null?50:Math.max(0,Math.min((1.1-cr)/0.6*100,100)),
+    f_stale_comp:          Math.min((emp.mthsSinceRaise||36)/36*100,100),
+    f_only_hire:           emp.onlyHire?100:0,
+    f_short_tenure:        Math.max(0,(2-Math.min(emp.tenure||0,2))/2*100),
+    f_no_bonus:            emp.hasBonus?0:70,
+    f_high_absence:        Math.min((emp.absenceCount||0)/10*100,100),
+    f_mgr_instability:     Math.min((emp.mgrChanges||0)/3*100,100),
+    f_high_pto_balance:    Math.min(Math.max(0,(emp.ptoDays||0)-20)/10*100,100),
+    f_internal_application:emp.internalApps>0?80:0,
+    f_early_career:        age<35?Math.max(0,(35-age)/(35-22)*100):0,
+    f_unmet_bonus:         (emp.bonusTarget>0&&emp.bonusEvents==0)?75:0,
+    f_not_calibrated:      emp.inCalibration?0:50,
+    f_open_req_in_dept:    Math.min((emp.openReqs||0)/3*100,100),
+    f_pay_group_compa:     pgcr==null?0:Math.max(0,Math.min((1.0-pgcr)/0.3*100,100)),
+    f_part_time:           0,
+    f_not_in_mentoring:    emp.inMentoring?0:25,
   }};
 }}
 const allScores = EMPLOYEES.map(e=>computeFactorScores(e));

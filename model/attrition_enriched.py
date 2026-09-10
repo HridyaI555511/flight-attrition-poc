@@ -144,7 +144,19 @@ job_changes = job_df.groupby('userId').size().reset_index(name='total_job_record
 job_latest = job_latest.merge(job_changes, on='userId')
 active = active.merge(job_latest[['userId','tenure_in_role_years','managerId','total_job_records']], on='userId', how='left')
 
-# Performance
+# Fallback: use dateOfCurrentPosition from SFSF employees when emp-job startDate is missing
+_dcp_rows = [{'userId': r['userId'], 'dateOfCurrentPosition': parse_date(r.get('dateOfCurrentPosition'))}
+             for r in _emp_active if r.get('dateOfCurrentPosition')]
+if _dcp_rows:
+    dcp_df = pd.DataFrame(_dcp_rows)
+    dcp_df['tenure_in_role_dcp'] = dcp_df['dateOfCurrentPosition'].apply(years_since)
+    active = active.merge(dcp_df[['userId','tenure_in_role_dcp']], on='userId', how='left')
+    active['tenure_in_role_years'] = active['tenure_in_role_years'].combine_first(active['tenure_in_role_dcp'])
+    active.drop(columns=['tenure_in_role_dcp'], inplace=True)
+    filled = active['tenure_in_role_years'].notna().sum()
+    print(f"tenure_in_role_years coverage after dateOfCurrentPosition fallback: {filled}/{len(active)}")
+
+# Performance — from performance-forms.json (rated forms only)
 perf_df = pd.DataFrame([{
     'userId': str(r['formSubjectId']),
     'rating': float(r['rating']) if r.get('rating') and str(r['rating']).replace('.','').isdigit() and float(r['rating']) > 0 else None,
@@ -159,6 +171,24 @@ perf_latest = (
     .rename(columns={'rating': 'perf_rating', 'reviewEnd': 'lastReviewDate'})
 )
 active = active.merge(perf_latest[['userId','perf_rating','lastReviewDate']] if not perf_latest.empty else pd.DataFrame(columns=['userId','perf_rating','lastReviewDate']), on='userId', how='left')
+
+# Fallback: use employees.performance field (stored as string "3.0") when no form rating
+_emp_perf_rows = []
+for r in _emp_active:
+    pval = r.get('performance')
+    if pval is not None:
+        try:
+            fval = float(pval)
+            if 0.5 <= fval <= 5.0:
+                _emp_perf_rows.append({'userId': r['userId'], 'emp_perf': fval})
+        except (ValueError, TypeError):
+            pass
+if _emp_perf_rows:
+    emp_perf_df = pd.DataFrame(_emp_perf_rows)
+    active = active.merge(emp_perf_df, on='userId', how='left')
+    active['perf_rating'] = active['perf_rating'].combine_first(active['emp_perf'])
+    active.drop(columns=['emp_perf'], inplace=True)
+    print(f"perf_rating coverage after employees.performance fallback: {active['perf_rating'].notna().sum()}/{len(active)}")
 active['months_since_review'] = active['lastReviewDate'].apply(months_since) if 'lastReviewDate' in active.columns else np.nan
 review_count = perf_df[perf_df['rating'].notna()].groupby('userId').size().reset_index(name='review_count') if not perf_df.empty else pd.DataFrame(columns=['userId','review_count'])
 active = active.merge(review_count, on='userId', how='left')
@@ -177,6 +207,26 @@ comp_latest = comp_df.sort_values('compDate', ascending=False).groupby('userId')
 comp_latest['months_since_comp_change'] = comp_latest['compDate'].apply(months_since)
 comp_latest['only_hire_comp'] = (comp_latest['eventReason'] == 'HIRNEW').astype(int)
 active = active.merge(comp_latest[['userId','months_since_comp_change','only_hire_comp']], on='userId', how='left')
+
+# Fallback: derive compensation recency from latest BASESAL record in emp-pay-recurring
+# (sfsf/compensation.json is often broken/empty in this tenant)
+if active['months_since_comp_change'].isna().all():
+    _sf_pay_comp_recs = []
+    for p in (load(SFSF, 'emp-pay-recurring') or []):
+        comp_code = str(p.get('payComponent', '')).upper()
+        if any(kw in comp_code for kw in BASE_COMP_KEYWORDS):
+            sd = parse_date(p.get('startDate'))
+            if sd:
+                _sf_pay_comp_recs.append({'userId': p['userId'], 'payDate': sd})
+    if _sf_pay_comp_recs:
+        pay_comp_df = pd.DataFrame(_sf_pay_comp_recs)
+        pay_comp_latest = pay_comp_df.sort_values('payDate', ascending=False).groupby('userId').first().reset_index()
+        pay_comp_latest['months_since_comp_change_fb'] = pay_comp_latest['payDate'].apply(months_since)
+        active = active.merge(pay_comp_latest[['userId','months_since_comp_change_fb']], on='userId', how='left')
+        active['months_since_comp_change'] = active['months_since_comp_change'].combine_first(active['months_since_comp_change_fb'])
+        active.drop(columns=['months_since_comp_change_fb'], inplace=True)
+        covered = active['months_since_comp_change'].notna().sum()
+        print(f"months_since_comp_change coverage after pay-recurring fallback: {covered}/{len(active)}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -510,6 +560,12 @@ print(f"Pay group coverage: {pg_coverage}/{len(active)} | Unique groups: {active
 # Best salary estimate: payroll direct → payroll recurring → SF-side recurring
 active['base_salary'] = active['salary_direct'].combine_first(active['annual_salary_pay']).combine_first(active['sf_annual_salary'])
 
+# Currency: payroll recurring → SF-side recurring fallback
+if 'sf_currency' in active.columns:
+    active['currency'] = active['currency'].combine_first(active['sf_currency'])
+currency_coverage = active['currency'].notna().sum()
+print(f"Currency coverage: {currency_coverage}/{len(active)}")
+
 # Compa-ratio proxy: salary vs dept median (within same currency group)
 dept_median = active.groupby('department')['base_salary'].median().reset_index(name='dept_median_salary')
 active = active.merge(dept_median, on='department', how='left')
@@ -804,6 +860,7 @@ export_cols = ['userId','firstName','lastName','department','division','location
                'mgr_change_count','org_change_count','title_change_count',
                'pto_balance_days','internal_app_count',
                'in_calibration','open_reqs_in_dept',
+               'in_mentoring',
                'risk_score','risk_band']
 active[export_cols].sort_values('risk_score', ascending=False).to_csv(
     OUTPUT / 'all_employees_enriched_risk.csv', index=False)

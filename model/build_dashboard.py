@@ -118,6 +118,7 @@ for _, row in expl.iterrows():
         'name':       str(row['name']),
         'dept':       str(row['department']) if pd.notna(row['department']) else '—',
         'riskScore':  round(float(row['risk_score']), 1),
+        'riskBand':   str(row['risk_band']) if pd.notna(row.get('risk_band')) else 'High',
         'salary':     int(row['base_salary']) if pd.notna(row['base_salary']) else None,
         'compaRatio': round(float(row['compa_ratio']), 3) if pd.notna(row['compa_ratio']) else None,
         'currency':   str(e.get('currency','')) if len(e) > 0 and pd.notna(e.get('currency')) else '',

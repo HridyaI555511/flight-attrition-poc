@@ -1,7 +1,7 @@
 {
   "name": "flight-attrition-mcp-server",
   "version": "1.0.0",
-  "description": "MCP server for SAP SuccessFactors OData — Playwright auth + cookie proxy",
+  "description": "MCP server for SAP SuccessFactors OData — OAuth2 / Basic Auth",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -11,9 +11,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "@playwright/test": "^1.61.0",
-    "playwright": "^1.61.0",
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "playwright": "^1.40.0",
+    "zod": "^3.22.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -1,6 +1,7 @@
 """
 RAG server for flight attrition conversational queries.
 Indexes employee profiles in ChromaDB, answers HR questions via the local `claude` CLI.
+Supports tool-calling loop for aggregate queries and SQLite-backed action tracking.
 
 Usage:
     python model/rag_server.py
@@ -8,6 +9,8 @@ Usage:
 """
 import json
 import math
+import re
+import sqlite3
 import subprocess
 import threading
 import time
@@ -20,13 +23,39 @@ from flask_cors import CORS
 import chromadb
 from rank_bm25 import BM25Okapi
 
-FIXTURES = Path(__file__).parent.parent / 'fixtures' / 'output'
-ROOT     = Path(__file__).parent.parent
-CSV_PATH = FIXTURES / 'all_employees_enriched_risk.csv'
+FIXTURES    = Path(__file__).parent.parent / 'fixtures' / 'output'
+ROOT        = Path(__file__).parent.parent
+CSV_PATH    = FIXTURES / 'all_employees_enriched_risk.csv'
 SUMMARY_PATH = FIXTURES / 'attrition_enriched_summary.json'
+ACTIONS_DB  = Path(__file__).parent / 'actions.db'
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Action tracking DB ────────────────────────────────────────────────────────
+def _init_db():
+    con = sqlite3.connect(ACTIONS_DB)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS retention_actions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            description TEXT,
+            owner       TEXT,
+            status      TEXT DEFAULT 'open',
+            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.commit()
+    con.close()
+
+_init_db()
+
+def _db():
+    con = sqlite3.connect(ACTIONS_DB)
+    con.row_factory = sqlite3.Row
+    return con
 
 
 def _safe(v, default='—'):
@@ -229,6 +258,125 @@ def _ask_claude(prompt: str) -> str:
         raise RuntimeError(result.stderr.strip() or 'claude CLI error')
     return result.stdout.strip()
 
+
+# ── Tool-calling engine ────────────────────────────────────────────────────────
+_TOOL_DESCRIPTIONS = """
+You have access to three tools for precise data computation. Use them when the question
+requires an exact number (average, count, sum, filter across all employees) that cannot
+be reliably estimated from the retrieved profiles alone.
+
+To call a tool, output ONLY a JSON object on a single line (nothing else before or after):
+
+{"tool":"aggregate","column":"<col>","metric":"mean|median|sum|count","group_by":"<col or null>","filter":"<pandas query string or null>"}
+{"tool":"query","filter":"<pandas query string>","limit":10}
+{"tool":"get_employee","user_id":"<userId>"}
+{"tool":"actions_summary"}
+
+Available columns: userId, firstName, lastName, department, division, location,
+  risk_score, risk_band, tenure_years, tenure_in_role_years, perf_rating,
+  base_salary, compa_ratio, pay_group_compa_ratio, absence_count, sick_count,
+  pto_balance_days, bonus_events, has_bonus, bonus_target, mgr_change_count,
+  title_change_count, in_calibration, open_reqs_in_dept, internal_app_count,
+  is_mentor, is_mentee, in_mentoring, age_years, fte
+
+Use pandas query syntax for filters, e.g.: risk_band == 'High' and department == 'Engineering'
+If the question can be answered from the retrieved profiles, answer directly — don't call a tool.
+"""
+
+def _run_tool(call: dict) -> str:
+    tool = call.get('tool')
+    try:
+        if tool == 'aggregate':
+            col      = call['column']
+            metric   = call.get('metric', 'mean')
+            group_by = call.get('group_by')
+            flt      = call.get('filter')
+            sub = df.query(flt) if flt else df
+            if sub.empty:
+                return 'No employees match that filter.'
+            if group_by:
+                result = getattr(sub.groupby(group_by)[col], metric)()
+                return result.sort_values(ascending=False).head(20).to_string()
+            val = getattr(sub[col], metric)()
+            return f"{metric}({col}) = {val:.2f} (n={len(sub)})"
+
+        elif tool == 'query':
+            flt   = call.get('filter', '')
+            limit = int(call.get('limit', 10))
+            sub   = df.query(flt) if flt else df
+            sub   = sub.head(limit)
+            return "\n\n".join(_build_doc(r.to_dict()) for _, r in sub.iterrows())
+
+        elif tool == 'get_employee':
+            uid  = str(call.get('user_id', ''))
+            rows = df[df['userId'].astype(str) == uid]
+            if rows.empty:
+                return f'No employee found with userId={uid}'
+            return _build_doc(rows.iloc[0].to_dict())
+
+        elif tool == 'actions_summary':
+            con = _db()
+            rows = con.execute(
+                "SELECT user_id, action_type, status, created_at FROM retention_actions ORDER BY created_at DESC"
+            ).fetchall()
+            con.close()
+            if not rows:
+                return 'No retention actions have been logged yet.'
+            actioned_ids = set(r['user_id'] for r in rows)
+            high_risk_ids = set(df[df['risk_band'] == 'High']['userId'].astype(str).tolist())
+            no_action = high_risk_ids - actioned_ids
+            lines = [f"Total actions logged: {len(rows)}"]
+            lines.append(f"High-risk employees with action: {len(high_risk_ids & actioned_ids)}")
+            lines.append(f"High-risk employees WITHOUT action: {len(no_action)}")
+            for r in rows[:20]:
+                lines.append(f"  {r['user_id']} | {r['action_type']} | {r['status']} | {r['created_at']}")
+            return "\n".join(lines)
+
+        else:
+            return f'Unknown tool: {tool}'
+    except Exception as e:
+        return f'Tool error: {e}'
+
+
+def _try_parse_tool(text: str) -> dict | None:
+    """Return parsed tool call dict if the response looks like one, else None."""
+    stripped = text.strip()
+    if not stripped.startswith('{'):
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        m = re.search(r'\{[^{}]+\}', stripped)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+def _chat_with_tools(system: str, context: str, history_text: str, message: str) -> str:
+    """Two-pass tool-calling loop using the claude CLI."""
+    pass1_prompt = (
+        f"{system}\n\n{_TOOL_DESCRIPTIONS}\n\n{context}{history_text}\n"
+        f"User: {message}\n\nAnswer (or JSON tool call):"
+    )
+    raw = _ask_claude(pass1_prompt)
+
+    tool_call = _try_parse_tool(raw)
+    if tool_call and 'tool' in tool_call:
+        tool_result = _run_tool(tool_call)
+        pass2_prompt = (
+            f"{system}\n\n{context}{history_text}\n"
+            f"User: {message}\n\n"
+            f"[Tool '{tool_call['tool']}' returned:]\n{tool_result}\n\n"
+            f"Now answer the user's question using both the retrieved profiles and the tool result:"
+        )
+        return _ask_claude(pass2_prompt)
+
+    return raw
+
+
 _SYSTEM = f"""You are an HR analytics assistant with access to attrition risk data for {summary['total_active_employees']} active employees sourced from SAP SuccessFactors and Payroll.
 
 Current risk distribution: {summary['risk_bands']['high']} High-risk (score > 60) | {summary['risk_bands']['medium']} Medium-risk (31–60) | {summary['risk_bands']['low']} Low-risk (≤ 30). Average risk score: {summary['avg_risk_score']}.
@@ -421,22 +569,83 @@ def chat():
         + "\n\n".join(retrieved_docs)
     )
 
-    # Build full prompt for claude CLI (no API — uses existing Claude Code auth)
+    # Build conversation history text
     history_text = ''
     for t in history:
         role = 'User' if t['role'] == 'user' else 'Assistant'
         history_text += f"\n{role}: {t['content']}\n"
 
-    prompt = f"{_SYSTEM}\n\n{context}{history_text}\nUser: {message}\n\nAnswer:"
-
     try:
-        answer = _ask_claude(prompt)
+        answer = _chat_with_tools(_SYSTEM, context, history_text, message)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
     sources = [m.get('user_id', '') for m in sem_metas[:5]]
 
     return jsonify({'response': answer, 'sources': sources})
+
+
+# ── Action tracking routes ─────────────────────────────────────────────────────
+@app.route('/actions', methods=['GET'])
+def list_actions():
+    user_id = request.args.get('user_id')
+    status  = request.args.get('status')
+    con = _db()
+    q, params = "SELECT * FROM retention_actions WHERE 1=1", []
+    if user_id:
+        q += " AND user_id = ?"; params.append(user_id)
+    if status:
+        q += " AND status = ?";  params.append(status)
+    q += " ORDER BY created_at DESC"
+    rows = [dict(r) for r in con.execute(q, params).fetchall()]
+    con.close()
+    return jsonify(rows)
+
+
+@app.route('/actions', methods=['POST'])
+def create_action():
+    data = request.get_json(force=True)
+    required = ('user_id', 'action_type')
+    if not all(data.get(k) for k in required):
+        return jsonify({'error': 'user_id and action_type are required'}), 400
+    con = _db()
+    cur = con.execute(
+        "INSERT INTO retention_actions (user_id, action_type, description, owner, status) VALUES (?,?,?,?,?)",
+        (data['user_id'], data['action_type'], data.get('description',''), data.get('owner',''), data.get('status','open'))
+    )
+    con.commit()
+    row = dict(con.execute("SELECT * FROM retention_actions WHERE id=?", (cur.lastrowid,)).fetchone())
+    con.close()
+    return jsonify(row), 201
+
+
+@app.route('/actions/<int:action_id>', methods=['PATCH'])
+def update_action(action_id):
+    data = request.get_json(force=True)
+    allowed = {'action_type', 'description', 'owner', 'status'}
+    updates = {k: v for k, v in data.items() if k in allowed}
+    if not updates:
+        return jsonify({'error': 'Nothing to update'}), 400
+    set_clause = ', '.join(f"{k}=?" for k in updates)
+    set_clause += ', updated_at=CURRENT_TIMESTAMP'
+    con = _db()
+    con.execute(f"UPDATE retention_actions SET {set_clause} WHERE id=?",
+                [*updates.values(), action_id])
+    con.commit()
+    row = con.execute("SELECT * FROM retention_actions WHERE id=?", (action_id,)).fetchone()
+    con.close()
+    if not row:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify(dict(row))
+
+
+@app.route('/actions/<int:action_id>', methods=['DELETE'])
+def delete_action(action_id):
+    con = _db()
+    con.execute("DELETE FROM retention_actions WHERE id=?", (action_id,))
+    con.commit()
+    con.close()
+    return '', 204
 
 
 if __name__ == '__main__':

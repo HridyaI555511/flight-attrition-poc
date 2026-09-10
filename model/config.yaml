@@ -1,0 +1,41 @@
+# Attrition model configuration
+# Adjust weights here without touching model code.
+# Weights must sum to 1.0 (or close — model normalises at runtime).
+
+risk_bands:
+  low_max: 30
+  medium_max: 60
+  # above medium_max = High
+
+thresholds:
+  pto_high_days: 20          # balance above this = high PTO signal
+  compa_below_market: 0.9    # compa-ratio below this = below market
+  role_stagnation_years: 5   # tenure in role above this = max stagnation score
+  stale_comp_months: 36      # months since comp change above this = max stale score
+  mgr_instability_changes: 3 # manager changes above this = max instability score
+  early_career_max_age: 35   # age below this contributes early-career signal
+  early_career_min_age: 22   # age at which early-career score peaks at 100
+  part_time_fte: 0.8         # FTE below this = part-time / reduced-hours signal
+
+data_quality:
+  min_active_employees: 50   # abort if fewer active employees loaded
+
+weights:
+  f_role_stagnation:      0.20
+  f_low_perf:             0.20
+  f_compa_ratio:          0.12
+  f_stale_comp:           0.08
+  f_only_hire:            0.00
+  f_short_tenure:         0.01
+  f_no_bonus:             0.06
+  f_high_absence:         0.08
+  f_mgr_instability:      0.02
+  f_high_pto_balance:     0.05
+  f_internal_application: 0.00
+  f_early_career:         0.03
+  f_unmet_bonus:          0.07
+  f_not_calibrated:       0.02
+  f_open_req_in_dept:     0.01
+  f_pay_group_compa:      0.02
+  f_part_time:            0.01
+  f_not_in_mentoring:     0.02

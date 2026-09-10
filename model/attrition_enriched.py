@@ -15,13 +15,23 @@ import matplotlib.gridspec as gridspec
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
+import yaml
 
 warnings.filterwarnings('ignore')
 
 SFSF    = Path(__file__).parent.parent / 'fixtures' / 'sfsf'
 PAYROLL = Path(__file__).parent.parent / 'fixtures' / 'payroll'
 OUTPUT  = Path(__file__).parent.parent / 'fixtures' / 'output'
-NOW     = datetime(2026, 8, 30, tzinfo=timezone.utc)
+NOW     = datetime.now(timezone.utc)
+
+_cfg_path = Path(__file__).parent / 'config.yaml'
+with open(_cfg_path) as _f:
+    _CFG = yaml.safe_load(_f)
+
+WEIGHTS   = _CFG['weights']
+_thresholds = _CFG['thresholds']
+_bands    = _CFG['risk_bands']
+_dq       = _CFG['data_quality']
 FAR_FUTURE_MS = 253402214400000
 
 FREQ_TO_ANNUAL = {'ANN': 1, 'MON': 12, 'SMT': 24, 'BWK': 26, 'BIM': 6, 'WKL': 52, 'HOURLY': 2080}
@@ -52,8 +62,13 @@ def months_since(dt):
     return max((NOW - dt).days / 30.44, 0) if dt else None
 
 def load(folder, name):
-    with open(folder / f'{name}.json') as f:
-        return json.load(f).get('d', {}).get('results', [])
+    p = folder / f'{name}.json'
+    if not p.exists():
+        return []
+    try:
+        return json.load(open(p)).get('d', {}).get('results', [])
+    except (json.JSONDecodeError, KeyError):
+        return []
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -61,30 +76,62 @@ def load(folder, name):
 # ══════════════════════════════════════════════════════════════════
 print("Loading SuccessFactors data...")
 
-# Employees
+# Active employees — fall back to payroll py-employees if SFSF fixture is missing/corrupt
+_emp_active = load(SFSF, 'employees')
+if not _emp_active:
+    _emp_active = load(PAYROLL, 'py-employees')
+    if _emp_active:
+        print("  WARNING: SFSF employees.json unavailable — using payroll py-employees as fallback")
+
+# Inactive/terminated employees (fetched separately with status=inactive filter)
+_emp_inactive_path = SFSF / 'employees-inactive.json'
+_emp_inactive = load(SFSF, 'employees-inactive') if _emp_inactive_path.exists() else []
+if _emp_inactive:
+    print(f"  Inactive employees loaded: {len(_emp_inactive)}")
+
+_all_emp = _emp_active + _emp_inactive
+
+# Employees — combine active + inactive for full population
 df = pd.DataFrame([{
     'userId':     r['userId'],
-    'firstName':  r['firstName'],
-    'lastName':   r['lastName'],
+    'firstName':  r.get('firstName', r.get('userId', 'Unknown')),
+    'lastName':   r.get('lastName', ''),
     'department': (r.get('department') or 'Unknown').split('(')[0].strip(),
     'division':   (r.get('division') or 'Unknown').split('(')[0].strip(),
     'location':   (r.get('location') or 'Unknown').split('(')[0].strip(),
     'hireDate':   parse_date(r.get('hireDate')),
-} for r in load(SFSF, 'employees')])
+} for r in _all_emp])
 df['tenure_years'] = df['hireDate'].apply(years_since)
 
-# Attrition label
+# Attrition label — fall back to payroll py-employment if SFSF employment is unavailable
+_empl_recs = load(SFSF, 'employment')
+if not _empl_recs:
+    _empl_recs = load(PAYROLL, 'py-employment')
+    if _empl_recs:
+        print("  WARNING: SFSF employment.json unavailable — using payroll py-employment as fallback")
 empl_df = pd.DataFrame([{
     'userId': r['userId'],
     'empEndDate': parse_date(r.get('endDate')),
-} for r in load(SFSF, 'employment')])
+} for r in _empl_recs])
 empl_df['attrited'] = empl_df['empEndDate'].notna().astype(int)
 df = df.merge(empl_df[['userId','attrited']], on='userId', how='left')
 df['attrited'] = df['attrited'].fillna(0).astype(int)
 active = df[df['attrited'] == 0].copy()
 
-# EmpJob — tenure in role
+# Data quality guard — abort early rather than silently score a partial dataset
+_min = _dq.get('min_active_employees', 50)
+if len(active) < _min:
+    raise RuntimeError(
+        f"Data quality check failed: only {len(active)} active employees loaded "
+        f"(minimum required: {_min}). Check fixture files and OData connectivity."
+    )
+
+# EmpJob — tenure in role (fall back to payroll py-emp-job if SFSF unavailable)
 job_raw = load(SFSF, 'emp-job')
+if not job_raw:
+    job_raw = load(PAYROLL, 'py-emp-job')
+    if job_raw:
+        print("  WARNING: SFSF emp-job.json unavailable — using payroll py-emp-job as fallback")
 job_df = pd.DataFrame([{
     'userId': r['userId'],
     'jobStartDate': parse_date(r['startDate']),
@@ -103,25 +150,30 @@ perf_df = pd.DataFrame([{
     'rating': float(r['rating']) if r.get('rating') and str(r['rating']).replace('.','').isdigit() and float(r['rating']) > 0 else None,
     'reviewEnd': parse_date(r.get('formReviewEndDate')),
 } for r in load(SFSF, 'performance-forms')])
+if perf_df.empty or 'rating' not in perf_df.columns:
+    perf_df = pd.DataFrame(columns=['userId', 'rating', 'reviewEnd'])
 perf_latest = (
     perf_df[perf_df['rating'].notna()]
     .sort_values('reviewEnd', ascending=False)
     .groupby('userId').first().reset_index()
     .rename(columns={'rating': 'perf_rating', 'reviewEnd': 'lastReviewDate'})
 )
-active = active.merge(perf_latest[['userId','perf_rating','lastReviewDate']], on='userId', how='left')
-active['months_since_review'] = active['lastReviewDate'].apply(months_since)
-review_count = perf_df[perf_df['rating'].notna()].groupby('userId').size().reset_index(name='review_count')
+active = active.merge(perf_latest[['userId','perf_rating','lastReviewDate']] if not perf_latest.empty else pd.DataFrame(columns=['userId','perf_rating','lastReviewDate']), on='userId', how='left')
+active['months_since_review'] = active['lastReviewDate'].apply(months_since) if 'lastReviewDate' in active.columns else np.nan
+review_count = perf_df[perf_df['rating'].notna()].groupby('userId').size().reset_index(name='review_count') if not perf_df.empty else pd.DataFrame(columns=['userId','review_count'])
 active = active.merge(review_count, on='userId', how='left')
 active['review_count'] = active['review_count'].fillna(0)
 
 # Compensation recency (SFSF)
+_comp_recs = load(SFSF, 'compensation')
 comp_df = pd.DataFrame([{
     'userId': r['userId'],
     'compDate': parse_date(r['startDate']),
     'eventReason': (r.get('eventReason') or '').upper(),
-} for r in load(SFSF, 'compensation')])
-comp_latest = comp_df.sort_values('compDate', ascending=False).groupby('userId').first().reset_index()
+} for r in _comp_recs] if _comp_recs else [])
+if comp_df.empty or 'compDate' not in comp_df.columns:
+    comp_df = pd.DataFrame(columns=['userId', 'compDate', 'eventReason'])
+comp_latest = comp_df.sort_values('compDate', ascending=False).groupby('userId').first().reset_index() if not comp_df.empty else pd.DataFrame(columns=['userId','compDate','eventReason'])
 comp_latest['months_since_comp_change'] = comp_latest['compDate'].apply(months_since)
 comp_latest['only_hire_comp'] = (comp_latest['eventReason'] == 'HIRNEW').astype(int)
 active = active.merge(comp_latest[['userId','months_since_comp_change','only_hire_comp']], on='userId', how='left')
@@ -341,6 +393,10 @@ print(f"Employees with internal job applications: {(active['internal_app_count']
 # ── SF-side recurring pay (additional salary source) ───────────────────────
 # Augments payroll salary coverage with SF-side pay components
 sf_pay_raw = load(SFSF, 'emp-pay-recurring') if (SFSF / 'emp-pay-recurring.json').exists() else []
+if not sf_pay_raw:
+    sf_pay_raw = load(PAYROLL, 'py-pay-recurring')
+    if sf_pay_raw:
+        print("  WARNING: SFSF emp-pay-recurring.json unavailable — using payroll py-pay-recurring as fallback")
 sf_base_records = []
 for p in sf_pay_raw:
     comp = str(p.get('payComponent', '')).upper()
@@ -462,7 +518,7 @@ active['compa_ratio'] = np.where(
     active['base_salary'] / active['dept_median_salary'],
     np.nan
 )
-active['below_market'] = (active['compa_ratio'] < 0.9).astype(float)
+active['below_market'] = (active['compa_ratio'] < _thresholds['compa_below_market']).astype(float)
 
 # Pay-group compa-ratio: salary vs pay group median (more precise than dept median)
 pg_median = active.groupby('pay_group')['base_salary'].median().reset_index(name='pg_median_salary')
@@ -479,6 +535,47 @@ print(f"Avg compa-ratio: {active['compa_ratio'].mean():.2f}")
 print(f"Below market (<0.9): {active['below_market'].sum():.0f} employees")
 print(f"Employees with bonus history: {active['has_bonus'].sum():.0f}")
 
+# ── FTE / part-time signal (from EmpJobGrade) ──────────────────────────────
+# Employees with FTE < 0.8 are either on reduced schedules or had hours cut.
+# Both scenarios correlate with lower engagement or involuntary restructuring.
+# FTE > 2.0 is assumed to be bad data (multiple contract rows summed) and capped.
+ej_grade_raw = load(SFSF, 'emp-job-grade') if (SFSF / 'emp-job-grade.json').exists() else []
+if ej_grade_raw:
+    fte_rows = []
+    for r in ej_grade_raw:
+        if r.get('fte') is not None:
+            try:
+                fte_val = float(r['fte'])
+                if 0 < fte_val <= 1.0:
+                    fte_rows.append({'userId': r['userId'], 'fte': fte_val})
+            except (ValueError, TypeError):
+                pass
+    if fte_rows:
+        fte_df = pd.DataFrame(fte_rows)
+        fte_latest = fte_df.groupby('userId')['fte'].min().reset_index()
+        active = active.merge(fte_latest, on='userId', how='left')
+    else:
+        active['fte'] = None
+else:
+    active['fte'] = None
+active['fte'] = active['fte'].fillna(1.0)
+part_time_n = int((active['fte'] < _thresholds.get('part_time_fte', 0.8)).sum())
+print(f"Part-time employees (FTE < {_thresholds.get('part_time_fte', 0.8)}): {part_time_n}")
+
+# ── Mentoring engagement (from MentoringProgramMatchedParticipant) ──────────
+# Being an active mentor or mentee is a strong protective signal: engaged employees
+# in mentoring relationships are significantly less likely to leave.
+mentoring_raw = load(SFSF, 'mentoring2') if (SFSF / 'mentoring2.json').exists() else []
+if not mentoring_raw:
+    mentoring_raw = load(SFSF, 'mentoring_full') if (SFSF / 'mentoring_full.json').exists() else []
+mentor_uids  = set(str(r['mentor'])  for r in mentoring_raw if r.get('mentor'))
+mentee_uids  = set(str(r['mentee'])  for r in mentoring_raw if r.get('mentee'))
+mentoring_uids = mentor_uids | mentee_uids
+active['is_mentor'] = active['userId'].isin(mentor_uids).astype(int)
+active['is_mentee'] = active['userId'].isin(mentee_uids).astype(int)
+active['in_mentoring'] = active['userId'].isin(mentoring_uids).astype(int)
+print(f"Mentors: {len(mentor_uids)} | Mentees: {len(mentee_uids)} | In mentoring: {active['in_mentoring'].sum()}")
+
 
 # ══════════════════════════════════════════════════════════════════
 # 3. ENRICHED RISK SCORING
@@ -489,10 +586,10 @@ def safe(s, default=0):
     return s.fillna(default)
 
 # Original 5 factors (60% weight)
-active['f_role_stagnation']  = np.clip(safe(active['tenure_in_role_years'], 0) / 5 * 100, 0, 100)
+active['f_role_stagnation']  = np.clip(safe(active['tenure_in_role_years'], 0) / _thresholds['role_stagnation_years'] * 100, 0, 100)
 active['f_low_perf']         = np.where(active['perf_rating'].isna(), 60,
                                 np.clip((5 - safe(active['perf_rating'], 3)) / 4 * 100, 0, 100))
-active['f_stale_comp']       = np.clip(safe(active['months_since_comp_change'], 36) / 36 * 100, 0, 100)
+active['f_stale_comp']       = np.clip(safe(active['months_since_comp_change'], _thresholds['stale_comp_months']) / _thresholds['stale_comp_months'] * 100, 0, 100)
 active['f_only_hire']        = safe(active['only_hire_comp'], 0) * 100
 active['f_short_tenure']     = np.clip((2 - np.minimum(safe(active['tenure_years'], 0), 2)) / 2 * 100, 0, 100)
 
@@ -504,67 +601,45 @@ active['f_compa_ratio']      = np.where(
 # No bonus history → lack of recognition/variable pay
 active['f_no_bonus']         = (1 - safe(active['has_bonus'], 0)) * 70
 
-# LOA flag kept in data exports for completeness, but not in model weights
-# (all active employees have loa_flag=0 in this demo instance since LOA employees are inactive)
 active['f_high_absence']     = np.clip(safe(active['absence_count'], 0) / 10 * 100, 0, 100)
 
-# Manager instability — multiple manager changes signal org instability or poor manager fit
-# 3+ changes = 100, 1-2 = 40-67, 0 = 0
-active['f_mgr_instability']  = np.clip(safe(active['mgr_change_count'], 0) / 3 * 100, 0, 100)
+active['f_mgr_instability']  = np.clip(safe(active['mgr_change_count'], 0) / _thresholds['mgr_instability_changes'] * 100, 0, 100)
 
-# High unused PTO balance — employees accumulate leave before resigning
-# p90 is ~20 days; normalise against that threshold
-active['f_high_pto_balance'] = np.clip(safe(active['pto_balance_days'], 0) / 20 * 100, 0, 100)
+active['f_high_pto_balance'] = np.clip(safe(active['pto_balance_days'], 0) / _thresholds['pto_high_days'] * 100, 0, 100)
 
-# Internal job applications — applying for roles internally signals desire to move;
-# if not placed, external offer risk rises. Binary in this dataset.
 active['f_internal_application'] = np.where(safe(active['internal_app_count'], 0) > 0, 60, 0)
 
-# Early career stage — employees under 32 have higher market mobility
-# Score peaks at age 22 (100), reaches 0 at age 35
-active['f_early_career'] = np.clip((35 - safe(active['age_years'], 40)) / 13 * 100, 0, 100)
+_ec_max = _thresholds['early_career_max_age']
+_ec_min = _thresholds['early_career_min_age']
+active['f_early_career'] = np.clip((_ec_max - safe(active['age_years'], 40)) / (_ec_max - _ec_min) * 100, 0, 100)
 
-# Unmet bonus expectation — has a bonus target in SF but no payout recorded
-# One of the most direct measures of unmet compensation expectations
 active['f_unmet_bonus'] = np.where(
     (safe(active['bonus_target'], 0) > 0) & (safe(active['has_bonus'], 0) == 0), 80, 0
 )
 
-# Not in calibration — employees absent from calibration have lower management visibility
 active['f_not_calibrated'] = (1 - safe(active['in_calibration'], 0)) * 30
 
-# Open requisitions in department — team gap signals burnout / instability pressure
 active['f_open_req_in_dept'] = np.where(safe(active['open_reqs_in_dept'], 0) > 0, 50, 0)
 
-# Pay group compa-ratio — employees below their pay group median (same comp class)
-# Uses pay group median when available; falls back to dept compa-ratio
 active['f_pay_group_compa'] = np.where(
     active['pay_group_compa_ratio'].notna(),
     np.clip((1.1 - active['pay_group_compa_ratio']) / 0.6 * 100, 0, 100),
-    active['f_compa_ratio']  # fall back to dept compa if no pay group data
+    active['f_compa_ratio']
 )
 
-WEIGHTS = {
-    'f_role_stagnation':      0.20,
-    'f_low_perf':             0.20,
-    'f_compa_ratio':          0.12,
-    'f_stale_comp':           0.08,
-    'f_only_hire':            0.00,
-    'f_short_tenure':         0.02,
-    'f_no_bonus':             0.06,
-    'f_high_absence':         0.08,
-    'f_mgr_instability':      0.02,
-    'f_high_pto_balance':     0.05,
-    'f_internal_application': 0.00,
-    'f_early_career':         0.03,
-    'f_unmet_bonus':          0.07,
-    'f_not_calibrated':       0.02,
-    'f_open_req_in_dept':     0.02,
-    'f_pay_group_compa':      0.03,
-}
+# Part-time / reduced FTE — employees below threshold get a moderate risk score;
+# full-time employees score 0. Signals reduced engagement or involuntary hour cuts.
+_pt_thresh = _thresholds.get('part_time_fte', 0.8)
+active['f_part_time'] = np.where(safe(active['fte'], 1.0) < _pt_thresh, 40, 0)
 
+# Employees not in any mentoring relationship score a mild risk penalty;
+# engaged mentors/mentees score 0 (protective — no risk contribution).
+active['f_not_in_mentoring'] = np.where(safe(active['in_mentoring'], 0) == 0, 25, 0)
+
+# Weights loaded from model/config.yaml
 active['risk_score'] = sum(active[col] * w for col, w in WEIGHTS.items())
-active['risk_band']  = pd.cut(active['risk_score'], bins=[0,30,60,101],
+active['risk_band']  = pd.cut(active['risk_score'],
+                               bins=[0, _bands['low_max'], _bands['medium_max'], 101],
                                labels=['Low','Medium','High'], include_lowest=True)
 
 print("\nEnriched risk band distribution:")
@@ -619,6 +694,7 @@ factor_labels = {
     'f_role_stagnation':      'Role\nStagnation',
     'f_low_perf':             'Low\nPerformance',
     'f_compa_ratio':          'Below\nMarket Pay ★',
+    'f_not_in_mentoring':     'Not in\nMentoring',
     'f_stale_comp':           'Stale\nCompensation',
     'f_only_hire':            'No Raise\nSince Hire',
     'f_short_tenure':         'Short\nTenure',
@@ -632,6 +708,7 @@ factor_labels = {
     'f_not_calibrated':       'Not in\nCalibration ★',
     'f_open_req_in_dept':     'Open Reqs\nin Dept ★',
     'f_pay_group_compa':      'Pay Group\nCompa ★',
+    'f_part_time':            'Part-Time /\nReduced FTE ★',
 }
 factors = list(WEIGHTS.keys())
 x = np.arange(len(factors))
@@ -689,20 +766,24 @@ top20 = (
 )
 top20.columns = ['First','Last','Department','Co.Tenure\n(yrs)','Role\nTenure (yrs)',
                  'Perf\nRating','Mths Since\nRaise','Compa-\nRatio','Bonus\nHistory','Risk\nScore']
-tbl = ax6.table(cellText=top20.values, colLabels=top20.columns,
-                cellLoc='center', loc='center', bbox=[0,0,1,1])
-tbl.auto_set_font_size(False)
-tbl.set_fontsize(7.5)
-for (row, col), cell in tbl.get_celld().items():
-    if row == 0:
-        cell.set(facecolor='#2c3e50')
-        cell.get_text().set(color='white', fontweight='bold')
-    elif row % 2 == 0:
-        cell.set_facecolor('#f8f9fa')
-    if col == len(top20.columns)-1 and row > 0:
-        score = float(top20.values[row-1][-1])
-        cell.set_facecolor('#e74c3c' if score > 60 else '#f39c12')
-        cell.get_text().set(fontweight='bold', color='white')
+if len(top20) > 0:
+    tbl = ax6.table(cellText=top20.values, colLabels=top20.columns,
+                    cellLoc='center', loc='center', bbox=[0,0,1,1])
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7.5)
+    for (row, col), cell in tbl.get_celld().items():
+        if row == 0:
+            cell.set(facecolor='#2c3e50')
+            cell.get_text().set(color='white', fontweight='bold')
+        elif row % 2 == 0:
+            cell.set_facecolor('#f8f9fa')
+        if col == len(top20.columns)-1 and row > 0:
+            score = float(top20.values[row-1][-1])
+            cell.set_facecolor('#e74c3c' if score > 60 else '#f39c12')
+            cell.get_text().set(fontweight='bold', color='white')
+else:
+    ax6.text(0.5, 0.5, 'No High-risk employees this run', ha='center', va='center',
+             fontsize=14, color='#27ae60', fontweight='bold', transform=ax6.transAxes)
 ax6.set_title('Top 20 High-Risk Employees (Enriched with Payroll Data)', fontsize=13, fontweight='bold', pad=20)
 
 plt.savefig(OUTPUT / 'attrition_enriched.png', dpi=150, bbox_inches='tight')
@@ -866,3 +947,196 @@ print("\n=== SUMMARY ===")
 print(json.dumps(summary, indent=2))
 print(f"\n=== TOP 10 HIGH-RISK EMPLOYEES ===")
 print(high.head(10)[['firstName','lastName','department','base_salary','compa_ratio','risk_score']].to_string(index=False))
+
+
+# ══════════════════════════════════════════════════════════════════
+# 6. BACKTEST — score historical leavers, measure separation
+# ══════════════════════════════════════════════════════════════════
+print("\n=== BACKTEST: Scoring Historical Leavers ===")
+
+terminated = df[df['attrited'] == 1].copy()
+
+# If employees-inactive.json is available, terminated profiles are already in df.
+# Otherwise reconstruct basic profiles from emp-job-history for the missing user IDs.
+term_ids_in_df = set(terminated['userId'].tolist())
+all_term_ids = {
+    r['userId']
+    for r in load(SFSF, 'employment')
+    if parse_date(r.get('endDate'))
+}
+# Augment with payroll employment: lastDateWorked and okToRehire=False
+_py_emp_raw = load(PAYROLL, 'py-employment')
+_py_term_ids = {
+    r['userId'] for r in _py_emp_raw
+    if r.get('lastDateWorked') and '/Date(-' not in str(r.get('lastDateWorked', ''))
+    and parse_date(r.get('lastDateWorked'))
+}
+_py_bad_exit_ids = {r['userId'] for r in _py_emp_raw if r.get('okToRehire') is False}
+all_term_ids = all_term_ids | _py_term_ids | _py_bad_exit_ids
+missing_ids = all_term_ids - term_ids_in_df
+
+if missing_ids:
+    # Build minimal profiles from emp-job-history (has dept/title) + employment (has tenure)
+    hist_by_uid: dict = defaultdict(list)
+    for r in job_hist_recs:
+        if r['userId'] in missing_ids:
+            hist_by_uid[r['userId']].append(r)
+
+    emp_end_dates = {
+        r['userId']: parse_date(r['endDate'])
+        for r in load(SFSF, 'employment')
+        if parse_date(r.get('endDate'))
+    }
+    emp_start_dates = {
+        r['userId']: parse_date(r.get('startDate'))
+        for r in load(SFSF, 'employment')
+        if r.get('startDate')
+    }
+
+    extra_rows = []
+    for uid in missing_ids:
+        jobs = sorted(hist_by_uid.get(uid, []), key=lambda x: x['seq'])
+        last = jobs[-1] if jobs else {}
+        hire = emp_start_dates.get(uid)
+        end  = emp_end_dates.get(uid)
+        extra_rows.append({
+            'userId':     uid,
+            'firstName':  uid,   # no profile — use userId as placeholder
+            'lastName':   '(inactive)',
+            'department': last.get('dept') or 'Unknown',
+            'division':   'Unknown',
+            'location':   'Unknown',
+            'hireDate':   hire,
+            'tenure_years': years_since(hire) if hire else None,
+            'attrited':   1,
+        })
+
+    if extra_rows:
+        extra_df = pd.DataFrame(extra_rows)
+        terminated = pd.concat([terminated, extra_df], ignore_index=True)
+        print(f"  Reconstructed {len(extra_rows)} terminated profiles from emp-job-history")
+
+print(f"Terminated employees found: {len(terminated)}")
+
+if len(terminated) > 0:
+    terminated = terminated.merge(job_latest[['userId','tenure_in_role_years','managerId','total_job_records']], on='userId', how='left')
+    terminated = terminated.merge(perf_latest[['userId','perf_rating','lastReviewDate']], on='userId', how='left')
+    terminated['months_since_review'] = terminated['lastReviewDate'].apply(months_since)
+    terminated = terminated.merge(review_count, on='userId', how='left')
+    terminated['review_count'] = terminated['review_count'].fillna(0)
+    terminated = terminated.merge(comp_latest[['userId','months_since_comp_change','only_hire_comp']], on='userId', how='left')
+    terminated = terminated.merge(py_users[['userId','salary_direct','dateOfCurrentPosition']], on='userId', how='left')
+    terminated = terminated.merge(pay_salary_max, on='userId', how='left')
+    terminated = terminated.merge(has_bonus, on='userId', how='left')
+    terminated = terminated.merge(bonus_count, on='userId', how='left')
+    terminated['has_bonus'] = terminated['has_bonus'].fillna(0)
+    terminated['bonus_events'] = terminated['bonus_events'].fillna(0)
+    terminated = terminated.merge(leave_summary, on='userId', how='left')
+    for col in ['absence_count', 'total_leave_days', 'loa_flag', 'sick_count']:
+        terminated[col] = terminated[col].fillna(0)
+    terminated = terminated.merge(change_df, on='userId', how='left')
+    for col in ['mgr_change_count', 'org_change_count', 'title_change_count']:
+        terminated[col] = terminated[col].fillna(0)
+    terminated = terminated.merge(pto_df, on='userId', how='left')
+    terminated['pto_balance_days'] = terminated['pto_balance_days'].fillna(0)
+    terminated['internal_app_count'] = 0
+    terminated = terminated.merge(age_df, on='userId', how='left')
+    terminated['age_years'] = terminated['age_years'].fillna(active['age_years'].median())
+    terminated['bonus_target'] = 0
+    terminated['in_calibration'] = 0
+    terminated['open_reqs_in_dept'] = terminated['department'].map(dept_open_reqs).fillna(0)
+    terminated = terminated.merge(sf_pay_max, on='userId', how='left')
+    terminated['base_salary'] = (
+        terminated['salary_direct']
+        .combine_first(terminated['annual_salary_pay'])
+        .combine_first(terminated['sf_annual_salary'])
+    )
+    terminated = terminated.merge(dept_median, on='department', how='left')
+    terminated['compa_ratio'] = np.where(
+        terminated['dept_median_salary'] > 0,
+        terminated['base_salary'] / terminated['dept_median_salary'],
+        np.nan
+    )
+    terminated['pay_group_compa_ratio'] = np.nan
+
+    # Same scoring factors
+    terminated['f_role_stagnation']      = np.clip(safe(terminated['tenure_in_role_years'], 0) / _thresholds['role_stagnation_years'] * 100, 0, 100)
+    terminated['f_low_perf']             = np.where(terminated['perf_rating'].isna(), 60,
+                                            np.clip((5 - safe(terminated['perf_rating'], 3)) / 4 * 100, 0, 100))
+    terminated['f_stale_comp']           = np.clip(safe(terminated['months_since_comp_change'], _thresholds['stale_comp_months']) / _thresholds['stale_comp_months'] * 100, 0, 100)
+    terminated['f_only_hire']            = safe(terminated['only_hire_comp'], 0) * 100
+    terminated['f_short_tenure']         = np.clip((2 - np.minimum(safe(terminated['tenure_years'], 0), 2)) / 2 * 100, 0, 100)
+    terminated['f_compa_ratio']          = np.where(terminated['compa_ratio'].isna(), 50, np.clip((1.1 - terminated['compa_ratio']) / 0.6 * 100, 0, 100))
+    terminated['f_no_bonus']             = (1 - safe(terminated['has_bonus'], 0)) * 70
+    terminated['f_high_absence']         = np.clip(safe(terminated['absence_count'], 0) / 10 * 100, 0, 100)
+    terminated['f_mgr_instability']      = np.clip(safe(terminated['mgr_change_count'], 0) / _thresholds['mgr_instability_changes'] * 100, 0, 100)
+    terminated['f_high_pto_balance']     = np.clip(safe(terminated['pto_balance_days'], 0) / _thresholds['pto_high_days'] * 100, 0, 100)
+    terminated['f_internal_application'] = 0
+    _ec_max = _thresholds['early_career_max_age']
+    _ec_min = _thresholds['early_career_min_age']
+    terminated['f_early_career']         = np.clip((_ec_max - safe(terminated['age_years'], 40)) / (_ec_max - _ec_min) * 100, 0, 100)
+    terminated['f_unmet_bonus']          = 0
+    terminated['f_not_calibrated']       = 30
+    terminated['f_open_req_in_dept']     = np.where(safe(terminated['open_reqs_in_dept'], 0) > 0, 50, 0)
+    terminated['f_pay_group_compa']      = terminated['f_compa_ratio']
+    terminated['f_part_time']            = 0  # FTE data unavailable for reconstructed profiles
+    terminated['f_not_in_mentoring']     = 25  # mentoring data unavailable for reconstructed profiles
+
+    terminated['risk_score'] = sum(terminated[col] * w for col, w in WEIGHTS.items())
+    terminated['risk_band']  = pd.cut(terminated['risk_score'],
+                                       bins=[0, _bands['low_max'], _bands['medium_max'], 101],
+                                       labels=['Low', 'Medium', 'High'], include_lowest=True)
+
+    n_leavers  = len(terminated)
+    n_high     = int((terminated['risk_band'] == 'High').sum())
+    n_medium   = int((terminated['risk_band'] == 'Medium').sum())
+    n_low      = int((terminated['risk_band'] == 'Low').sum())
+    capture    = round((n_high + n_medium) / n_leavers * 100, 1)
+    avg_leaver = round(float(terminated['risk_score'].mean()), 1)
+    avg_active_bt = round(float(active['risk_score'].mean()), 1)
+
+    score_bin_edges = list(range(0, 105, 10))
+    score_labels_bt = [f'{b}–{b+10}' for b in score_bin_edges[:-1]]
+
+    def _bin(scores):
+        counts = [0] * len(score_labels_bt)
+        for s in scores:
+            counts[min(int(s // 10), len(counts)-1)] += 1
+        return counts
+
+    leaver_counts = _bin(terminated['risk_score'].tolist())
+    active_counts = _bin(active['risk_score'].tolist())
+    leaver_pct = [round(c / n_leavers * 100, 1) for c in leaver_counts]
+    active_pct  = [round(c / len(active) * 100, 1) for c in active_counts]
+
+    backtest = {
+        'generated_at':     NOW.isoformat(),
+        'n_leavers':        n_leavers,
+        'n_high':           n_high,
+        'n_medium':         n_medium,
+        'n_low':            n_low,
+        'capture_rate_pct': capture,
+        'avg_leaver_score': avg_leaver,
+        'avg_active_score': avg_active_bt,
+        'score_separation': round(avg_leaver - avg_active_bt, 1),
+        'leaver_scores':    terminated['risk_score'].round(1).tolist(),
+        'score_labels':     score_labels_bt,
+        'leaver_hist_pct':  leaver_pct,
+        'active_hist_pct':  active_pct,
+        'note': (
+            f'n={n_leavers} historical leavers identified from employment.endDate. '
+            'Scores use current data snapshots as proxies for pre-departure state — '
+            'not true time-series reconstruction. Treat as directional signal only. '
+            'Expand historical fixture data from SF Reports for higher-confidence validation.'
+        ),
+    }
+    with open(OUTPUT / 'backtest_results.json', 'w') as f:
+        json.dump(backtest, f, indent=2)
+
+    print(f"Leavers: {n_leavers} | High: {n_high} | Medium: {n_medium} | Low: {n_low}")
+    print(f"Capture rate (High+Medium): {capture}%")
+    print(f"Avg score — leavers: {avg_leaver}  active: {avg_active_bt}  separation: +{avg_leaver - avg_active_bt:.1f}")
+    print("  Saved: backtest_results.json")
+else:
+    backtest = None
+    print("No terminated employees found — skipping backtest.")

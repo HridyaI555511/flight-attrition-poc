@@ -224,6 +224,26 @@ html = f"""<!DOCTYPE html>
   .reasons li::before{{content:attr(data-n)". ";font-weight:700;color:#0070f3}}
   .reasons li b{{color:#2c3e50}}
   .count-label{{font-size:13px;color:#666;margin-bottom:10px}}
+  /* ── Action tracking ── */
+  .action-bar{{display:flex;align-items:center;gap:8px;padding:10px 0 4px;border-top:1px solid #f0f0f0;margin-top:10px}}
+  .log-action-btn{{padding:5px 14px;background:#0070f3;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600}}
+  .log-action-btn:hover{{background:#005acc}}
+  .action-list{{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}}
+  .action-pill{{background:#e8f0fe;color:#1a73e8;border-radius:12px;padding:2px 10px;font-size:11px;display:flex;align-items:center;gap:4px}}
+  .action-pill.done{{background:#e9f7ef;color:#1e8449}}
+  .action-pill .del-act{{cursor:pointer;color:#999;margin-left:2px;font-size:10px}}
+  /* ── Action modal ── */
+  #actionModal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;align-items:center;justify-content:center}}
+  #actionModal.open{{display:flex}}
+  .modal-box{{background:#fff;border-radius:12px;padding:28px;width:420px;max-width:95vw;box-shadow:0 8px 32px rgba(0,0,0,.2)}}
+  .modal-box h3{{margin-bottom:16px;font-size:16px}}
+  .modal-box label{{display:block;font-size:12px;font-weight:600;color:#666;margin-bottom:4px;margin-top:12px}}
+  .modal-box select,.modal-box input,.modal-box textarea{{width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;font-size:13px;font-family:inherit}}
+  .modal-box textarea{{height:70px;resize:vertical}}
+  .modal-actions{{display:flex;gap:8px;margin-top:18px;justify-content:flex-end}}
+  .modal-actions button{{padding:8px 18px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}}
+  .btn-cancel{{background:#f0f0f0;color:#333}}
+  .btn-save{{background:#0070f3;color:#fff}}
   /* ── Ask AI ── */
   .chat-wrap{{max-width:860px;margin:0 auto;display:flex;flex-direction:column;height:calc(100vh - 180px);min-height:500px}}
   .chat-status{{display:flex;align-items:center;gap:8px;padding:6px 0 12px;font-size:13px;color:#666}}
@@ -392,12 +412,40 @@ html = f"""<!DOCTYPE html>
         <button class="chip" onclick="useChip(this)">Which employees have low pay and no performance review?</button>
         <button class="chip" onclick="useChip(this)">Suggest retention actions for our high-risk cohort</button>
         <button class="chip" onclick="useChip(this)">Which departments have the most role stagnation?</button>
+        <button class="chip" onclick="useChip(this)">Which high-risk employees have no retention action logged yet?</button>
+        <button class="chip" onclick="useChip(this)">What is the average tenure of high-risk employees?</button>
       </div>
     </div>
     <div class="chat-msgs" id="chatMsgs"></div>
     <div class="chat-in-row">
       <input id="chatIn" type="text" placeholder="Ask about your workforce risk data..." onkeydown="if(event.key==='Enter')sendChat()">
       <button id="chatBtn" onclick="sendChat()">Send</button>
+    </div>
+  </div>
+</div>
+
+<div id="actionModal">
+  <div class="modal-box">
+    <h3 id="modalTitle">Log Retention Action</h3>
+    <input type="hidden" id="modalUserId">
+    <label>Action Type</label>
+    <select id="modalType">
+      <option value="Compensation Review">Compensation Review</option>
+      <option value="Career Conversation">Career Conversation</option>
+      <option value="Performance Coaching">Performance Coaching</option>
+      <option value="Mentoring Setup">Mentoring Setup</option>
+      <option value="Role Change / Promotion">Role Change / Promotion</option>
+      <option value="Retention Bonus Offer">Retention Bonus Offer</option>
+      <option value="1:1 Check-In">1:1 Check-In</option>
+      <option value="Other">Other</option>
+    </select>
+    <label>Description</label>
+    <textarea id="modalDesc" placeholder="What was discussed / agreed..."></textarea>
+    <label>Owner (HR / Manager)</label>
+    <input id="modalOwner" type="text" placeholder="e.g. Sarah Jones">
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeActionModal()">Cancel</button>
+      <button class="btn-save" onclick="saveAction()">Log Action</button>
     </div>
   </div>
 </div>
@@ -618,7 +666,7 @@ function renderCards(data) {{
     const reasons = [c.explanation_1,c.explanation_2,c.explanation_3].map((r,i)=>
       `<li data-n="${{i+1}}">${{r.replace(/\\*\\*(.*?)\\*\\*/g,'<b>$1</b>')}}</li>`
     ).join('');
-    return `<div class="card" data-name="${{c.name.toLowerCase()}}" data-dept="${{c.dept.toLowerCase()}}" data-factors="${{c.topFactors.map(f=>f.label).join('|')}}">
+    return `<div class="card" data-userid="${{c.userId}}" data-name="${{c.name.toLowerCase()}}" data-dept="${{c.dept.toLowerCase()}}" data-factors="${{c.topFactors.map(f=>f.label).join('|')}}">
       <div class="card-header ${{c.riskBand}}">
         <div>
           <div class="card-name">#${{c.rank}} — ${{c.name}}</div>
@@ -630,6 +678,10 @@ function renderCards(data) {{
         <div class="data-badges">${{badges}}</div>
         <div class="factor-tags">${{factors}}</div>
         <ol class="reasons">${{reasons}}</ol>
+        <div class="action-bar">
+          <button class="log-action-btn" onclick="openActionModal('${{c.userId}}','${{c.name}}')">+ Log Action</button>
+          <div class="action-list" id="actions-${{c.userId}}"></div>
+        </div>
       </div>
     </div>`;
   }}).join('');
@@ -663,6 +715,90 @@ function sortCardsData(d) {{
 function sortCards() {{ filterCards(); }}
 
 renderCards(cardsData);
+
+// ── Action tracking ────────────────────────────────────────────────────────
+const RAG_ACTIONS = 'http://localhost:5001';
+
+async function loadAllActions() {{
+  try {{
+    const rows = await fetch(`${{RAG_ACTIONS}}/actions`).then(r=>r.json());
+    // Group by user_id
+    const byUser = {{}};
+    rows.forEach(a => {{
+      if (!byUser[a.user_id]) byUser[a.user_id] = [];
+      byUser[a.user_id].push(a);
+    }});
+    Object.entries(byUser).forEach(([uid, actions]) => {{
+      const el = document.getElementById(`actions-${{uid}}`);
+      if (el) renderActionPills(el, actions);
+    }});
+  }} catch(e) {{ /* RAG server offline */ }}
+}}
+
+function renderActionPills(el, actions) {{
+  el.innerHTML = actions.map(a =>
+    `<span class="action-pill ${{a.status==='done'?'done':''}}" title="${{a.description||''}}">
+      ${{a.action_type}}
+      <span class="del-act" onclick="deleteAction(${{a.id}},'${{a.user_id}}')">✕</span>
+    </span>`
+  ).join('');
+}}
+
+function openActionModal(userId, name) {{
+  document.getElementById('modalUserId').value = userId;
+  document.getElementById('modalTitle').textContent = `Log Retention Action — ${{name}}`;
+  document.getElementById('modalDesc').value = '';
+  document.getElementById('modalOwner').value = '';
+  document.getElementById('actionModal').classList.add('open');
+}}
+
+function closeActionModal() {{
+  document.getElementById('actionModal').classList.remove('open');
+}}
+
+async function saveAction() {{
+  const userId = document.getElementById('modalUserId').value;
+  const payload = {{
+    user_id:     userId,
+    action_type: document.getElementById('modalType').value,
+    description: document.getElementById('modalDesc').value,
+    owner:       document.getElementById('modalOwner').value,
+    status:      'open',
+  }};
+  try {{
+    const resp = await fetch(`${{RAG_ACTIONS}}/actions`, {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify(payload)
+    }});
+    if (resp.ok) {{
+      closeActionModal();
+      const row = await resp.json();
+      const el = document.getElementById(`actions-${{userId}}`);
+      if (el) {{
+        const existing = Array.from(el.querySelectorAll('.action-pill')).map(p => ({{
+          id: parseInt(p.querySelector('.del-act').getAttribute('onclick').match(/\d+/)[0]),
+          action_type: p.textContent.trim().replace('✕','').trim(),
+          status: p.classList.contains('done') ? 'done' : 'open',
+          description: p.title,
+          user_id: userId,
+        }}));
+        renderActionPills(el, [...existing, row]);
+      }}
+    }}
+  }} catch(e) {{ alert('Could not save action — is the RAG server running?'); }}
+}}
+
+async function deleteAction(id, userId) {{
+  if (!confirm('Delete this action?')) return;
+  try {{
+    await fetch(`${{RAG_ACTIONS}}/actions/${{id}}`, {{method:'DELETE'}});
+    loadAllActions();
+  }} catch(e) {{}}
+}}
+
+// Load actions on page load and after tab switch to explanations
+document.querySelector('[onclick*="explanations"]')?.addEventListener('click', ()=>setTimeout(loadAllActions,100));
+loadAllActions();
 
 // ── validation tab ─────────────────────────────────────────────────────────
 (function buildValidation() {{

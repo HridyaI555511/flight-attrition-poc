@@ -56,10 +56,12 @@ def parse_date(val):
     return None
 
 def years_since(dt):
-    return max((NOW - dt).days / 365.25, 0) if dt else None
+    if not isinstance(dt, datetime): return None
+    return max((NOW - dt).days / 365.25, 0)
 
 def months_since(dt):
-    return max((NOW - dt).days / 30.44, 0) if dt else None
+    if not isinstance(dt, datetime): return None
+    return max((NOW - dt).days / 30.44, 0)
 
 def load(folder, name):
     p = folder / f'{name}.json'

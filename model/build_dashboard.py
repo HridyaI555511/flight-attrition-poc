@@ -100,6 +100,8 @@ for _, row in df.iterrows():
     })
 
 # Build high-risk cards JSON (merge explanations with main df)
+df['userId'] = df['userId'].astype(str)
+expl['userId'] = expl['userId'].astype(str)
 merged = expl.merge(
     df[['userId','tenure_years','tenure_in_role_years','perf_rating',
         'months_since_comp_change','base_salary','currency','compa_ratio',

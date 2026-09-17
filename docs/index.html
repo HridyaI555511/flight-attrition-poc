@@ -167,7 +167,8 @@
       <canvas id="deptChart"></canvas>
     </div>
     <div class="chart-card">
-      <h3>Factor Weights</h3>
+      <h3>What Drives Attrition Risk</h3>
+      <p style="font-size:12px;color:#888;margin-bottom:8px">% weight each signal contributes to an employee's overall risk score</p>
       <canvas id="weightChart"></canvas>
     </div>
   </div>
@@ -405,13 +406,14 @@ new Chart(document.getElementById('deptChart'), {
   options:{indexAxis:'y',plugins:{legend:{display:false},annotation:{annotations:{line1:{type:'line',xMin:avgScore,xMax:avgScore,borderColor:'#666',borderDash:[4,4]}}}},scales:{x:{max:105}}}
 });
 
-// Weight pie
+// Weight pie (exclude zero-weight factors)
+const fKeysActive = fKeys.filter(k => WEIGHTS[k] > 0);
 new Chart(document.getElementById('weightChart'), {
   type:'doughnut',
   data:{
-    labels:fKeys.map(k=>FACTOR_LABELS[k]),
+    labels:fKeysActive.map(k=>FACTOR_LABELS[k]),
     datasets:[{
-      data:fKeys.map(k=>Math.round(WEIGHTS[k]*100)),
+      data:fKeysActive.map(k=>Math.round(WEIGHTS[k]*100)),
       backgroundColor:['#e74c3c','#f39c12','#9b59b6','#3498db','#1abc9c','#e67e22','#95a5a6','#2ecc71'],
       borderWidth:2
     }]
